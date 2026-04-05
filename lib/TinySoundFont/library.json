@@ -1,0 +1,8 @@
+{
+  "name": "TinySoundFont",
+  "version": "0.9.0",
+  "description": "Header-only SF2 soundfont renderer and MIDI loader",
+  "license": "MIT",
+  "authors": [{ "name": "Bernhard Schelling" }],
+  "build": { "includeDir": "." }
+}
