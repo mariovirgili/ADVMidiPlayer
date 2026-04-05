@@ -194,7 +194,7 @@ private:
         hdr += p;
         if (hdr.length() > 33) hdr = hdr.substring(0, 33);
         d.setCursor(3, 2); d.print(hdr);
-        char cnt[12]; snprintf(cnt, 12, "%d voci", (int)e.size());
+        char cnt[12]; snprintf(cnt, 12, "%d items", (int)e.size());
         d.setCursor(W - (int)strlen(cnt)*6 - 2, 2); d.print(cnt);
 
         // File list
@@ -235,7 +235,7 @@ private:
         d.fillRect(0, H-FOOT_H, W, FOOT_H, FS_FOOT_BG);
         d.setTextColor(FS_FOOT_TXT, FS_FOOT_BG);
         d.setCursor(2, H-FOOT_H+2);
-        d.print("W/S:nav  ENTER:apri  BKSP:su  ESC:annulla  lettera:salta");
+        d.print(";.:nav /:open ,:up ESC:cancel A-Z:jump");
     }
 };
 

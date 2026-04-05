@@ -1,117 +1,142 @@
-# GM MIDI Player — M5Stack Cardputer ADV
-### PlatformIO · No PSRAM · SF2 da SD · File browser · 16 canali
+# GM MIDI Player - M5Stack Cardputer ADV
+### PlatformIO - No PSRAM - SF2 from SD - File browser - 16 channels
 
 ---
 
-## Struttura progetto
+## Project layout
 
-```
-MidiGMPlayer_pio/
-├── platformio.ini
-├── src/
-│   └── main.cpp
-├── include/
-│   └── FileSelector.h
-├── lib/
-│   └── TinySoundFont/
-│       ├── library.json
-│       ├── tsf.h
-│       └── tml.h
-└── README.md
+```text
+ADVMidiPlayer/
+|-- platformio.ini
+|-- src/
+|   `-- main.cpp
+|-- include/
+|   |-- CardputerKeyboard.h
+|   `-- FileSelector.h
+|-- lib/
+|   `-- TinySoundFont/
+|       |-- library.json
+|       |-- tsf.h
+|       `-- tml.h
+|-- media/
+`-- README.md
 ```
 
 ---
 
-## Build
+## Build and upload
+
+`platformio.ini` is already configured for:
+
+- `cardputer_adv` as the default environment
+- `COM4` for upload and monitor
+- `dio` flash mode
+- `utf-8` serial monitor encoding
 
 ```bash
-# Prima build (scarica toolchain ESP32-S3, ~500MB, una tantum)
+# First build (downloads the ESP32-S3 toolchain the first time)
 pio run -e cardputer_adv
 
-# Carica sul dispositivo
-# Prima metti in modalità download: Spegni → tieni G0 → accendi → rilascia G0
-pio run -e cardputer_adv --target upload
+# Upload to the Cardputer ADV
+pio run -e cardputer_adv -t upload
 
-# Monitor seriale
+# Serial monitor
 pio device monitor
 
-# Cardputer v1.1 (senza ES8311)
-pio run -e cardputer_v11 --target upload
+# Cardputer v1.1 build/upload (without the ES8311 option)
+pio run -e cardputer_v11 -t upload
 ```
+
+If automatic upload does not start, put the board into download mode manually:
+power off -> hold `G0` -> power on -> release `G0`.
 
 ---
 
-## Modalità audio
+## Audio modes
 
-| # | Modalità | Hz | Canali | Hardware |
+### Cardputer ADV
+
+| # | Mode | Hz | Channels | Hardware |
 |---|---|---|---|---|
-| 1 | ES8311 integrato ADV | 44100 | Stereo | Jack 3.5mm + speaker (nativo ADV) |
-| 2 | I2S DAC esterno | 22050 | Stereo | MAX98357A / PCM5102 |
-| 3 | PDM GPIO2 | 16000 | Mono | Speaker interno (nessun extra) |
-| 4 | PWM LEDC GPIO2 | 16000 | Mono | Speaker interno (nessun extra) |
+| 1 | ADV built-in ES8311 | 44100 | Mono | 3.5mm jack + internal speaker |
+| 2 | External I2S DAC | 22050 | Stereo | MAX98357A / PCM5102 |
+| 3 | PDM GPIO2 | 16000 | Mono | Cardputer built-in speaker |
+| 4 | PWM LEDC GPIO2 | 16000 | Mono | Cardputer built-in speaker |
 
-### Wiring I2S DAC esterno (solo modalità 2)
-```
+### Cardputer v1.1
+
+`cardputer_v11` removes the ES8311 mode and renumbers the remaining options from `1` to `3`.
+
+### External I2S DAC wiring
+
+```text
 DAC          Cardputer ADV
-─────────────────────────────
-BCLK  ──────► GPIO 8
-LRCLK ──────► GPIO 7
-DIN   ──────► GPIO 6
-GND   ──────► GND
-VCC   ──────► 3.3V
+--------------------------
+BCLK   ----> GPIO 8
+LRCLK  ----> GPIO 7
+DIN    ----> GPIO 6
+GND    ----> GND
+VCC    ----> 3.3V
 ```
+
+Only the external I2S DAC path is stereo. Internal Cardputer output paths are mono.
 
 ---
 
-## SD Card
+## SD card
 
-Struttura libera — il file browser naviga tutta la SD.
+The SD layout is flexible. The file browser can navigate the whole card.
 
-```
+```text
 /
-├── soundfonts/
-│   └── gm.sf2       ← max ~200KB senza PSRAM
-└── midi/
-    └── *.mid
+|-- soundfonts/
+|   `-- gm.sf2       <- keep it under about 200 KB without PSRAM
+`-- midi/
+    `-- *.mid
 ```
 
-**⚠️ Dimensione SF2**: senza PSRAM heap disponibile ~300KB.
-Usa Polyphone per creare SF2 < 200KB (8kHz, 8-bit).
+**SF2 size note:** without PSRAM, available heap is limited to roughly 300 KB.
+Using Polyphone to create an SF2 below about 200 KB is recommended, for example with 8 kHz / 8-bit samples.
 
 ---
 
-## Controlli
+## Controls
 
-| Tasto | Azione |
+| Key | Action |
 |---|---|
 | `SPACE` | Play / Pause |
-| `ENTER` o `>` | Traccia successiva |
-| `<` | Traccia precedente |
-| `R` | Riavvolgi |
-| `L` | Toggle loop (`[L]` in header) |
-| `+` / `-` | Volume ±3dB |
-| `F` | Apri selettore file (SF2 o MIDI) |
+| `/` or `ENTER` | Next track |
+| `,` | Previous track |
+| `R` | Restart current track |
+| `L` | Toggle loop (`[L]` in the header) |
+| `;` | Volume up (+3 dB) |
+| `.` | Volume down (-3 dB) |
+| `F` | Open the runtime file selector |
+
+Secondary volume aliases `+`, `=` and `-` are also accepted.
 
 ### File browser
-| Tasto | Azione |
+
+| Key | Action |
 |---|---|
-| `W` / `S` | Su / Giù |
-| `ENTER` | Apri cartella / seleziona file |
-| `BKSP` | Cartella superiore |
-| `ESC` | Annulla |
-| Lettera | Salta alla prima voce con quella iniziale |
+| `;` | Move up |
+| `.` | Move down |
+| `/` or `ENTER` | Open folder / select file |
+| `,` or `BACKSPACE` | Go to parent folder |
+| `Fn` + `` ` `` | Cancel |
+| `A-Z` | Jump to the first matching entry |
 
 ---
 
-## Config automatica (`/midi_player.cfg`)
+## Automatic config (`/midi_player.cfg`)
 
 ```ini
 sf2=/soundfonts/gm.sf2
-midi=/midi/brano.mid
+midi=/midi/song.mid
 audiomode=1
 mididx=0
 ```
 
-Salvata ad ogni cambio. Al prossimo boot tutti i selettori
-partono dall'ultimo path usato.
-Per resettare: cancella `/midi_player.cfg` dalla SD.
+The config is saved automatically after every change. On the next boot, selectors start from the last used path.
+
+To reset it, delete `/midi_player.cfg` from the SD card.

@@ -5,7 +5,7 @@
  * ══════════════════════════════════════════════════════════════════════════════
  *
  *  Modalità audio (menu interattivo al boot):
- *    1 → ES8311  codec integrato ADV  — jack 3.5mm + speaker, 44100Hz stereo
+ *    1 → ES8311  codec integrato ADV  — jack 3.5mm + speaker, 44100Hz mono
  *    2 → I2S DAC esterno              — MAX98357A/PCM5102,    22050Hz stereo
  *    3 → PDM speaker GPIO2            — nessun HW extra,      16000Hz mono
  *    4 → PWM LEDC GPIO2              — fallback,             16000Hz mono
@@ -103,16 +103,24 @@ static uint32_t  g_sampleRate = 22050;
 #define I2S_DMA_LEN   256
 #define MAX_VOICES    16
 
-static int16_t g_audioBuf[CHUNK_FRAMES * 2];
-static int16_t g_monoBuf [CHUNK_FRAMES];
+static int16_t g_audioBuf[CHUNK_FRAMES];
+static int16_t g_i2sBuf [CHUNK_FRAMES * 2];
 
 static volatile uint32_t g_pwmIdx  = 0;
 static volatile bool     g_pwmDone = false;
 static hw_timer_t*       g_pwmTimer = nullptr;
 
+static inline bool useStereoSynthOutput() {
+  return g_audioMode == AUDIO_I2S_DAC;
+}
+
+static inline enum TSFOutputMode currentSynthOutputMode() {
+  return useStereoSynthOutput() ? TSF_STEREO_INTERLEAVED : TSF_MONO;
+}
+
 void IRAM_ATTR pwmISR() {
   if (g_pwmIdx < (uint32_t)CHUNK_FRAMES)
-    ledcWrite(LEDC_CH, (uint8_t)((g_monoBuf[g_pwmIdx++] >> 8) + 128));
+    ledcWrite(LEDC_CH, (uint8_t)((g_audioBuf[g_pwmIdx++] >> 8) + 128));
   else { g_pwmDone = true; g_pwmIdx = 0; }
 }
 
@@ -207,7 +215,7 @@ static void initAudio() {
       g_sampleRate = 44100;
       M5.Speaker.setVolume(200);
       M5.Speaker.begin();
-      Serial.printf("[AUDIO] ES8311  %uHz stereo\n", g_sampleRate);
+      Serial.printf("[AUDIO] ES8311  %uHz mono\n", g_sampleRate);
       break;
     }
 
@@ -278,9 +286,11 @@ static void initAudio() {
 // AUDIO TASK  (Core 0, max priority)
 // ══════════════════════════════════════════════════════════════════════════════
 
-static void stereoToMono(const int16_t* s, int16_t* m, int n) {
-  for (int i = 0; i < n; i++)
-    m[i] = (int16_t)(((int32_t)s[i*2] + s[i*2+1]) >> 1);
+static void monoToStereoDup(const int16_t* mono, int16_t* stereo, int n) {
+  for (int i = 0; i < n; i++) {
+    stereo[i * 2]     = mono[i];
+    stereo[i * 2 + 1] = mono[i];
+  }
 }
 
 static void audioTask(void*) {
@@ -288,23 +298,29 @@ static void audioTask(void*) {
   while (true) {
     if (g_tsf && g_playing) {
       xSemaphoreTake(g_tsfMutex, portMAX_DELAY);
-      tsf_render_short(g_tsf, g_audioBuf, CHUNK_FRAMES, 0);
+      if (useStereoSynthOutput()) {
+        tsf_render_short(g_tsf, g_i2sBuf, CHUNK_FRAMES, 0);
+      } else {
+        tsf_render_short(g_tsf, g_audioBuf, CHUNK_FRAMES, 0);
+      }
       xSemaphoreGive(g_tsfMutex);
     } else {
       memset(g_audioBuf, 0, sizeof(g_audioBuf));
+      memset(g_i2sBuf, 0, sizeof(g_i2sBuf));
     }
 
     switch (g_audioMode) {
       case AUDIO_ES8311:
+        monoToStereoDup(g_audioBuf, g_i2sBuf, CHUNK_FRAMES);
+        i2s_write(I2S_NUM_0, g_i2sBuf, CHUNK_FRAMES * 4, &written, portMAX_DELAY);
+        break;
       case AUDIO_I2S_DAC:
-        i2s_write(I2S_NUM_0, g_audioBuf, CHUNK_FRAMES * 4, &written, portMAX_DELAY);
+        i2s_write(I2S_NUM_0, g_i2sBuf, CHUNK_FRAMES * 4, &written, portMAX_DELAY);
         break;
       case AUDIO_PDM:
-        stereoToMono(g_audioBuf, g_monoBuf, CHUNK_FRAMES);
-        i2s_write(I2S_NUM_0, g_monoBuf, CHUNK_FRAMES * 2, &written, portMAX_DELAY);
+        i2s_write(I2S_NUM_0, g_audioBuf, CHUNK_FRAMES * 2, &written, portMAX_DELAY);
         break;
       case AUDIO_PWM:
-        stereoToMono(g_audioBuf, g_monoBuf, CHUNK_FRAMES);
         g_pwmDone = false; g_pwmIdx = 0;
         while (!g_pwmDone) taskYIELD();
         break;
@@ -328,7 +344,7 @@ static bool loadSF2(const char* path) {
   g_tsf = tsf_load(&s);
   g_sf2File.close();
   if (!g_tsf) { Serial.println("[SF2] tsf_load fallito"); return false; }
-  tsf_set_output(g_tsf, TSF_STEREO_INTERLEAVED, (int)g_sampleRate, g_vol_dB);
+  tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
   tsf_set_max_voices(g_tsf, MAX_VOICES);
   Serial.printf("[SF2] OK  preset=%d  heap=%u\n",
     tsf_get_presetcount(g_tsf), heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
@@ -552,7 +568,7 @@ static void drawProgressBar() {
   }
   d.setTextColor(C_DIM, C_BAR_BG);
   d.setCursor(1, y + 3);
-  d.print("SPC:ply  <>:trk  R:rew  L:loop  +/-:vol  F:file");
+  d.print("SPC:play  ,/:trk  ;.:vol  L:loop  F:file");
 }
 
 static void drawChannelRow(int ch) {
@@ -678,31 +694,31 @@ static AudioMode selectAudioMode(int saved) {
 
 #ifndef CARDPUTER_V11
   const Opt opts[] = {
-    { AUDIO_ES8311,  "1", "ES8311 integrato ADV",
-      "44kHz stereo - qualita' massima",
-      "Jack 3.5mm + speaker interno",  0xFFE0 },
-    { AUDIO_I2S_DAC, "2", "I2S DAC esterno",
-      "22kHz stereo - ottima qualita'",
-      "MAX98357A / PCM5102 su GPIO 6/7/8", 0x07E0 },
+    { AUDIO_ES8311,  "1", "ADV built-in ES8311",
+      "44kHz mono - built-in output",
+      "3.5mm jack + internal speaker",  0xFFE0 },
+    { AUDIO_I2S_DAC, "2", "External I2S DAC",
+      "22kHz stereo - external DAC",
+      "MAX98357A / PCM5102 on GPIO 6/7/8", 0x07E0 },
     { AUDIO_PDM,     "3", "PDM speaker GPIO2",
-      "16kHz mono - nessun HW extra",
-      "Speaker integrato Cardputer",   0x07FF },
+      "16kHz mono - no extra hardware",
+      "Cardputer built-in speaker",   0x07FF },
     { AUDIO_PWM,     "4", "PWM LEDC GPIO2",
-      "16kHz mono - fallback universale",
-      "Speaker integrato Cardputer",   0xFD20 },
+      "16kHz mono - universal fallback",
+      "Cardputer built-in speaker",   0xFD20 },
   };
   const int N = 4;
 #else
   const Opt opts[] = {
-    { AUDIO_I2S_DAC, "1", "I2S DAC esterno",
-      "22kHz stereo - ottima qualita'",
-      "MAX98357A / PCM5102 su GPIO 6/7/8", 0x07E0 },
+    { AUDIO_I2S_DAC, "1", "External I2S DAC",
+      "22kHz stereo - external DAC",
+      "MAX98357A / PCM5102 on GPIO 6/7/8", 0x07E0 },
     { AUDIO_PDM,     "2", "PDM speaker GPIO2",
-      "16kHz mono - nessun HW extra",
-      "Speaker integrato Cardputer",   0x07FF },
+      "16kHz mono - no extra hardware",
+      "Cardputer built-in speaker",   0x07FF },
     { AUDIO_PWM,     "3", "PWM LEDC GPIO2",
-      "16kHz mono - fallback universale",
-      "Speaker integrato Cardputer",   0xFD20 },
+      "16kHz mono - universal fallback",
+      "Cardputer built-in speaker",   0xFD20 },
   };
   const int N = 3;
 #endif
@@ -718,7 +734,7 @@ static AudioMode selectAudioMode(int saved) {
   auto draw = [&]() {
     d.fillScreen((uint16_t)0x000A);
     d.setTextColor(C_ACCENT, (uint16_t)0x000A); d.setTextSize(1);
-    d.setCursor(4, 4); d.print("GM MIDI PLAYER  \xBB  Uscita audio");
+    d.setCursor(4, 4); d.print("GM MIDI PLAYER  \xBB  Audio output");
     d.drawFastHLine(0, 14, 240, C_ACCENT);
     for (int i = 0; i < N; i++) {
       int      y = 17 + i * rowH;
@@ -743,7 +759,9 @@ static AudioMode selectAudioMode(int saved) {
     d.fillRect(0, 124, 240, 11, (uint16_t)0x1082);
     d.setTextColor(C_DIM, (uint16_t)0x1082);
     d.setCursor(4, 127);
-    d.print("W/S:nav  1-4:scelta rapida  ENTER:conferma");
+    char footer[40];
+    snprintf(footer, sizeof(footer), ";.:nav  1-%d:quick  / or ENT:ok", N);
+    d.print(footer);
   };
 
   draw();
@@ -822,12 +840,12 @@ static void openFileSelector() {
   auto drawMenu = [&]() {
     d.fillScreen((uint16_t)0x000A);
     d.setTextColor(C_ACCENT, (uint16_t)0x000A); d.setTextSize(1);
-    d.setCursor(4, 4); d.print("Cambia file:");
+    d.setCursor(4, 4); d.print("Change file:");
     d.drawFastHLine(0, 14, 240, C_ACCENT);
     struct { const char* k; const char* l; uint16_t c; } opts[] = {
-      { "1", "Soundfont  (.sf2)", 0x07E0 },
-      { "2", "Brano MIDI (.mid)", 0x07FF },
-      { "3", "Annulla",           0x8410 },
+      { "1", "GM Soundfont (.sf2)", 0x07E0 },
+      { "2", "MIDI File   (.mid)", 0x07FF },
+      { "3", "Cancel",            0x8410 },
     };
     for (int i = 0; i < 3; i++) {
       int y = 22 + i * 34;
@@ -840,7 +858,7 @@ static void openFileSelector() {
     }
     d.fillRect(0, 123, 240, 12, (uint16_t)0x1082);
     d.setTextColor(C_DIM, (uint16_t)0x1082); d.setCursor(4, 126);
-    d.print(";/.:nav  / o ENTER:ok  , o ESC:annulla");
+    d.print(";.:nav  / or ENT:ok  , or ESC:back");
   };
   drawMenu();
 
@@ -881,14 +899,14 @@ static void openFileSelector() {
   if (choice == 1) {
     String dir = "/";
     { int sl = g_cfg.sf2Path.lastIndexOf('/'); if (sl > 0) dir = g_cfg.sf2Path.substring(0, sl); }
-    String chosen = FileSelector::select({ ".sf2", ".SF2" }, dir, "Soundfont GM");
+    String chosen = FileSelector::select({ ".sf2", ".SF2" }, dir, "GM Soundfont");
     if (chosen.length() > 0) {
-      showBusy("Caricamento SF2...",
+      showBusy("Loading SF2...",
                chosen.substring(chosen.length() > 28 ? chosen.length()-28 : 0).c_str());
       if (loadSF2(chosen.c_str())) {
         g_cfg.sf2Path = chosen; saveConfig(g_cfg);
       } else {
-        showError("Errore SF2!", "File non valido o troppo grande", "Ripristino...");
+        showError("SF2 Error!", "Invalid or oversized file", "Restoring...");
         delay(2000);
         loadSF2(g_cfg.sf2Path.c_str());
       }
@@ -897,7 +915,7 @@ static void openFileSelector() {
   } else if (choice == 2) {
     String dir = "/";
     { int sl = g_cfg.midiPath.lastIndexOf('/'); if (sl > 0) dir = g_cfg.midiPath.substring(0, sl); }
-    String chosen = FileSelector::select({ ".mid",".midi",".MID",".MIDI" }, dir, "Brano MIDI");
+    String chosen = FileSelector::select({ ".mid",".midi",".MID",".MIDI" }, dir, "MIDI File");
     if (chosen.length() > 0) {
       g_cfg.midiPath = chosen;
       int sl = chosen.lastIndexOf('/');
@@ -972,35 +990,35 @@ void setup() {
   initAudio();
 
   // SF2 file browser
-  sl_("Selezione soundfont...");
+  sl_("Select soundfont...");
   {
     String dir = "/";
     { int sl = g_cfg.sf2Path.lastIndexOf('/'); if (sl > 0) dir = g_cfg.sf2Path.substring(0, sl); }
-    String chosen = FileSelector::select({ ".sf2",".SF2" }, dir, "Soundfont GM (.sf2)");
+    String chosen = FileSelector::select({ ".sf2",".SF2" }, dir, "GM Soundfont (.sf2)");
     if (chosen.length() > 0) g_cfg.sf2Path = chosen;
     if (g_cfg.sf2Path.isEmpty()) g_cfg.sf2Path = "/gm.sf2";
   }
 
   // Load SF2
-  sl_("Caricamento SF2...");
+  sl_("Loading SF2...");
   d.setTextColor((uint16_t)0x4208, (uint16_t)0x000A);
   d.setCursor(14, sy); d.print(g_cfg.sf2Path.c_str()); sy += 12;
   if (!loadSF2(g_cfg.sf2Path.c_str())) {
-    showError("Errore SF2!", g_cfg.sf2Path.c_str(), "File non valido o troppo grande");
+    showError("SF2 Error!", g_cfg.sf2Path.c_str(), "Invalid or oversized file");
     delay(3000);
   } else {
     sl_("SF2 OK");
   }
 
   // MIDI file browser
-  sl_("Selezione brano MIDI...");
+  sl_("Select MIDI file...");
   {
     String dir = "/";
     { int sl = g_cfg.midiPath.lastIndexOf('/'); if (sl > 0) dir = g_cfg.midiPath.substring(0, sl); }
-    String chosen = FileSelector::select({ ".mid",".midi",".MID",".MIDI" }, dir, "Brano MIDI (.mid)");
+    String chosen = FileSelector::select({ ".mid",".midi",".MID",".MIDI" }, dir, "MIDI File (.mid)");
     if (chosen.length() > 0) g_cfg.midiPath = chosen;
     if (g_cfg.midiPath.isEmpty()) {
-      showError("Nessun MIDI selezionato!");
+      showError("No MIDI file selected!");
       for (;;) delay(1000);
     }
   }
@@ -1015,7 +1033,7 @@ void setup() {
 
   // Save the full config.
   saveConfig(g_cfg);
-  sl_("Config salvata");
+  sl_("Config saved");
 
   // Audio task on Core 0.
   g_tsfMutex = xSemaphoreCreateMutex();
@@ -1083,7 +1101,7 @@ void loop() {
         g_vol_dB = (g_vol_dB + 3.0f < 0.0f) ? g_vol_dB + 3.0f : 0.0f;
         if (g_tsf) {
           xSemaphoreTake(g_tsfMutex, portMAX_DELAY);
-          tsf_set_output(g_tsf, TSF_STEREO_INTERLEAVED, (int)g_sampleRate, g_vol_dB);
+          tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
           xSemaphoreGive(g_tsfMutex);
         }
         Serial.printf("[VOL] %.0f dB\n", g_vol_dB);
@@ -1094,7 +1112,7 @@ void loop() {
         g_vol_dB = (g_vol_dB - 3.0f > -40.0f) ? g_vol_dB - 3.0f : -40.0f;
         if (g_tsf) {
           xSemaphoreTake(g_tsfMutex, portMAX_DELAY);
-          tsf_set_output(g_tsf, TSF_STEREO_INTERLEAVED, (int)g_sampleRate, g_vol_dB);
+          tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
           xSemaphoreGive(g_tsfMutex);
         }
         Serial.printf("[VOL] %.0f dB\n", g_vol_dB);
