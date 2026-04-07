@@ -1,71 +1,85 @@
 # GM MIDI Player - M5Stack Cardputer ADV
-### PlatformIO - No PSRAM - SF2 from SD - File browser - 16 channels
+### PlatformIO firmware for MIDI playback with SF2 soundfonts, SD browser, runtime menu, and persistent settings
 
 ---
 
-## Project layout
+## Overview
 
-```text
-ADVMidiPlayer/
-|-- platformio.ini
-|-- src/
-|   `-- main.cpp
-|-- include/
-|   |-- CardputerKeyboard.h
-|   `-- FileSelector.h
-|-- lib/
-|   `-- TinySoundFont/
-|       |-- library.json
-|       |-- tsf.h
-|       `-- tml.h
-|-- media/
-`-- README.md
-```
+This project turns the **M5Stack Cardputer ADV** into a **General MIDI player** that:
+
+- loads **SF2 soundfonts** from the SD card
+- plays **`.mid` / `.midi`** files from the SD card
+- shows a **16-channel live monitor** during playback
+- supports **multiple audio outputs**
+- keeps the latest **audio mode / soundfont / MIDI selection** across reboots
+- includes an **embedded boot splash image**
+
+The firmware is designed for the **Cardputer ADV without PSRAM**, so it focuses on low-memory strategies and stable playback on internal RAM only.
 
 ---
 
-## Build and upload
+## Main firmware features
 
-`platformio.ini` is already configured for:
+- **Interactive boot flow**
+  - embedded splash screen shown at boot
+  - audio output selection menu
+  - SF2 selection
+  - MIDI selection
 
-- `cardputer_adv` as the default environment
-- `COM4` for upload and monitor
-- `dio` flash mode
-- `utf-8` serial monitor encoding
+- **Runtime menu**
+  - available from the player screen with `M`
+  - lets you change:
+    - audio output
+    - soundfont
+    - MIDI file
 
-```bash
-# First build (downloads the ESP32-S3 toolchain the first time)
-pio run -e cardputer_adv
+- **Persistent configuration on SD**
+  - config path: `/Midi/midi_player.cfg`
+  - if `/Midi` does not exist, it is created automatically
+  - stores:
+    - last audio output
+    - last soundfont
+    - last MIDI file
+    - last MIDI index in the current folder
 
-# Upload to the Cardputer ADV
-pio run -e cardputer_adv -t upload
+- **File browser**
+  - browses the full SD card
+  - remembers the last selected file and reopens with the cursor on it
+  - page navigation with `,` and `/`
 
-# Serial monitor
-pio device monitor
+- **Playback engine**
+  - TinySoundFont-based SF2 rendering
+  - custom MIDI streaming parser
+  - optional **raw MIDI buffering in internal RAM** when enough headroom is available
+  - total MIDI duration detection and display
+  - automatic next-track advance with optional loop mode
 
-# Cardputer v1.1 build/upload (without the ES8311 option)
-pio run -e cardputer_v11 -t upload
-```
+- **UI**
+  - 16 channel rows with note/program activity
+  - scrolling title marquee for long file names
+  - partial redraws to reduce flicker
+  - progress bar and elapsed/total time
 
-If automatic upload does not start, put the board into download mode manually:
-power off -> hold `G0` -> power on -> release `G0`.
+- **Idle behavior**
+  - if playback stays stopped for more than **5 seconds**, the splash image is shown again
+  - the splash stays visible until a key is pressed
 
 ---
 
-## Audio modes
+## Audio outputs
 
 ### Cardputer ADV
 
-| # | Mode | Hz | Channels | Hardware |
+| # | Mode | Sample rate | Channels | Hardware |
 |---|---|---|---|---|
-| 1 | ADV built-in ES8311 | 22050 | Mono | 3.5mm jack + internal speaker |
-| 2 | External I2S DAC | 22050 | Stereo | MAX98357A / PCM5102 |
-| 3 | PDM GPIO2 | 16000 | Mono | Cardputer built-in speaker |
-| 4 | PWM LEDC GPIO2 | 16000 | Mono | Cardputer built-in speaker |
+| 1 | ADV built-in ES8311 | 22050 Hz | Mono | 3.5 mm jack + internal speaker |
+| 2 | External I2S DAC | 22050 Hz | Stereo | MAX98357A / PCM5102 |
+| 3 | PDM GPIO2 | 16000 Hz | Mono | Built-in speaker |
+| 4 | PWM LEDC GPIO2 | 16000 Hz | Mono | Built-in speaker |
 
 ### Cardputer v1.1
 
-`cardputer_v11` removes the ES8311 mode and renumbers the remaining options from `1` to `3`.
+The `cardputer_v11` environment removes the ES8311 option and renumbers the remaining outputs from `1` to `3`.
 
 ### External I2S DAC wiring
 
@@ -79,41 +93,73 @@ GND    ----> GND
 VCC    ----> 3.3V
 ```
 
-Only the external I2S DAC path is stereo. Internal Cardputer output paths are mono.
+Only the **external I2S DAC** path is stereo. Internal Cardputer outputs are mono.
 
 ---
 
-## SD card
+## SD card layout
 
-The SD layout is flexible. The file browser can navigate the whole card.
+The browser can navigate the whole SD card, but a structure like this is recommended:
 
 ```text
 /
-|-- soundfonts/
-|   `-- gm.sf2       <- keep it under about 200 KB without PSRAM
-`-- midi/
-    `-- *.mid
+|-- Midi/
+|   |-- midi_player.cfg
+|   |-- Songs/
+|   |   `-- *.mid
+|   `-- SF2/
+|       `-- *.sf2
+`-- other folders...
 ```
 
-**SF2 size note:** without PSRAM, available heap is limited to roughly 300 KB.
-Using Polyphone to create an SF2 below about 200 KB is recommended, for example with 8 kHz / 8-bit samples.
+The firmware does not require fixed folder names for songs and soundfonts, but it does store its config under `/Midi`.
+
+---
+
+## Memory and playback characteristics
+
+This firmware targets a **no-PSRAM** Cardputer ADV, so memory handling matters.
+
+- **SF2** files are loaded from SD into TinySoundFont.
+- **MIDI** files are parsed through a custom streaming path.
+- When possible, the raw MIDI file is copied into **internal RAM** for faster access.
+- A safety headroom is kept before buffering large MIDI files in RAM.
+- Internal ES8311 playback uses a **pre-render / queued-buffer path** to reduce stutter.
+- `MAX_VOICES` is currently set to **16**.
+
+Practical recommendations:
+
+- prefer **small or very small soundfonts** for the built-in audio path
+- use the **external I2S DAC** mode if you want the least compromise
+- very large or dense MIDI files can still be heavier than simple GM files
 
 ---
 
 ## Controls
 
+### Player screen
+
 | Key | Action |
 |---|---|
 | `SPACE` | Play / Pause |
-| `/` or `ENTER` | Next track |
+| `/` | Next track |
 | `,` | Previous track |
 | `R` | Restart current track |
-| `L` | Toggle loop (`[L]` in the header) |
+| `L` | Toggle loop |
 | `;` | Volume up (+3 dB) |
 | `.` | Volume down (-3 dB) |
-| `F` | Open the runtime file selector |
+| `M` | Open runtime menu |
 
 Secondary volume aliases `+`, `=` and `-` are also accepted.
+
+### Runtime menu
+
+Available from the player screen with `M`:
+
+- `Audio Output`
+- `GM Soundfont (.sf2)`
+- `MIDI File (.mid)`
+- `Cancel`
 
 ### File browser
 
@@ -121,23 +167,127 @@ Secondary volume aliases `+`, `=` and `-` are also accepted.
 |---|---|
 | `;` | Move up |
 | `.` | Move down |
-| `/` or `ENTER` | Open folder / select file |
-| `,` or `BACKSPACE` | Go to parent folder |
+| `,` | Previous page |
+| `/` | Next page |
+| `ENTER` | Open folder / select file |
+| `BACKSPACE` | Go to parent folder |
 | `Fn` + `` ` `` | Cancel |
 | `A-Z` | Jump to the first matching entry |
 
 ---
 
-## Automatic config (`/Midi/midi_player.cfg`)
+## Configuration file
+
+Path:
+
+```text
+/Midi/midi_player.cfg
+```
+
+Format:
 
 ```ini
-sf2=/soundfonts/gm.sf2
-midi=/midi/song.mid
+sf2=/Midi/SF2/Small Soundfont.sf2
+midi=/Midi/Songs/song.mid
 audiomode=1
 mididx=0
 ```
 
-The config is saved automatically after every change. On the next boot, selectors start from the last used path.
-If `/Midi` does not exist on the SD card, it is created automatically.
+Notes:
 
-To reset it, delete `/Midi/midi_player.cfg` from the SD card.
+- the file is saved automatically after relevant changes
+- the firmware can still read the old legacy config path `/midi_player.cfg`
+- if you want to reset everything, delete `/Midi/midi_player.cfg`
+
+---
+
+## Build and upload
+
+`platformio.ini` is configured for:
+
+- `cardputer_adv` as the main environment
+- `COM4` for upload and monitor
+- `dio` flash mode
+- `utf-8` serial monitor encoding
+- `921600` upload speed in PlatformIO
+
+Standard commands:
+
+```bash
+pio run -e cardputer_adv
+pio run -e cardputer_adv -t upload
+pio device monitor
+```
+
+Cardputer v1.1:
+
+```bash
+pio run -e cardputer_v11 -t upload
+```
+
+### Alternate Windows build config
+
+The repository also includes:
+
+```text
+platformio_build_alt.ini
+```
+
+This is useful on Windows when `.pio/build` gets locked and you want to build into `.pio/build_alt` instead.
+
+Example:
+
+```bash
+pio run -c platformio_build_alt.ini -e cardputer_adv -j 1
+```
+
+---
+
+## Embedded assets
+
+The boot splash used by the firmware is embedded from:
+
+```text
+media/ScreenTitle_boot.jpg
+```
+
+This means the splash does **not** depend on the SD card to be visible at boot.
+
+---
+
+## Project layout
+
+```text
+ADVMidiPlayer/
+|-- platformio.ini
+|-- platformio_build_alt.ini
+|-- src/
+|   `-- main.cpp
+|-- include/
+|   |-- CardputerKeyboard.h
+|   `-- FileSelector.h
+|-- lib/
+|   `-- TinySoundFont/
+|       |-- library.json
+|       |-- tsf.h
+|       `-- tml.h
+|-- media/
+|   |-- ScreenTitle.jpg
+|   `-- ScreenTitle_boot.jpg
+`-- README.md
+```
+
+---
+
+## Current firmware profile
+
+- Board target: **Cardputer ADV / ESP32-S3**
+- Flash mode: **DIO**
+- CPU: **240 MHz**
+- Internal output default: **ES8311 22050 Hz mono**
+- External DAC mode: **22050 Hz stereo**
+- Synth voices: **16**
+- Config persistence: **enabled**
+- Runtime menu: **enabled**
+- Embedded splash: **enabled**
+
