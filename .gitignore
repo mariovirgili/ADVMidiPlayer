@@ -1,4 +1,5 @@
 .pio
+.claude/
 .vscode/
 MidiGMPlayer_pio.zip
 .vscode/.browse.c_cpp.db*

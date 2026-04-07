@@ -9,7 +9,7 @@
  *   ESC / `      → annulla → ritorna ""
  *   a-z          → salta alla prima voce che inizia con quella lettera
  *
- * Config salvata su SD in /midi_player.cfg:
+ * Config salvata su SD in /Midi/midi_player.cfg:
  *   sf2=/path/file.sf2
  *   midi=/path/file.mid
  *   audiomode=1
@@ -19,8 +19,8 @@
 /*
  * English summary:
  * - SD file browser for the Cardputer.
- * - ; and . move up/down, , goes to the parent folder, / or Enter confirms.
- * - Fn+` cancels and returns an empty string.
+ * - ; and . move up/down, , and / move by one full page, Enter opens/selects.
+ * - Backspace goes to the parent folder. Fn+` cancels and returns an empty string.
  */
 
 #include <M5Cardputer.h>
@@ -30,7 +30,9 @@
 
 #include "CardputerKeyboard.h"
 
-#define CFG_PATH "/midi_player.cfg"
+#define CFG_DIR "/Midi"
+#define CFG_PATH "/Midi/midi_player.cfg"
+#define CFG_PATH_LEGACY "/midi_player.cfg"
 
 // ── Palette ──────────────────────────────────────────────────────────────────
 #define FS_BG       0x0000u
@@ -74,12 +76,43 @@ public:
     // Returns the full selected path, or "" if cancelled.
     static String select(const std::vector<String>& ext,
                          const String& start = "/",
-                         const char*   title = "Seleziona")
+                         const char*   title = "Select")
     {
-        String curDir = start.isEmpty() ? "/" : start;
+        String curDir = "/";
+        String initialName;
+        bool applyInitialSelection = false;
         int cursor = 0, scroll = 0;
         std::vector<FsEntry> entries;
         bool redraw = true;
+
+        auto applyStartPath = [&]() {
+            String startPath = start.isEmpty() ? "/" : start;
+            File probe = SD.open(startPath.c_str());
+            if (probe) {
+                if (probe.isDirectory()) {
+                    curDir = startPath;
+                } else {
+                    initialName = String(probe.name());
+                    int slash = startPath.lastIndexOf('/');
+                    curDir = (slash > 0) ? startPath.substring(0, slash) : "/";
+                    applyInitialSelection = initialName.length() > 0;
+                }
+                probe.close();
+                return;
+            }
+
+            int slash = startPath.lastIndexOf('/');
+            if (slash >= 0) {
+                String tail = startPath.substring(slash + 1);
+                if (tail.indexOf('.') >= 0) {
+                    initialName = tail;
+                    curDir = (slash > 0) ? startPath.substring(0, slash) : "/";
+                    applyInitialSelection = initialName.length() > 0;
+                    return;
+                }
+            }
+            curDir = startPath;
+        };
 
         auto loadDir = [&]() {
             entries.clear(); cursor = 0; scroll = 0;
@@ -104,8 +137,22 @@ public:
             }
             dir.close();
             std::sort(entries.begin(), entries.end());
+
+            if (applyInitialSelection && initialName.length() > 0) {
+                for (int i = 0; i < (int)entries.size(); ++i) {
+                    if (entries[i].name.equalsIgnoreCase(initialName)) {
+                        cursor = i;
+                        scroll = (cursor > VISIBLE_ROWS / 2) ? cursor - VISIBLE_ROWS / 2 : 0;
+                        int maxScroll = std::max(0, (int)entries.size() - VISIBLE_ROWS);
+                        if (scroll > maxScroll) scroll = maxScroll;
+                        break;
+                    }
+                }
+            }
+            applyInitialSelection = false;
         };
 
+        applyStartPath();
         loadDir();
         cardputer_keyboard::KeysState prevKeys{};
 
@@ -118,16 +165,14 @@ public:
 
             if (cardputer_keyboard::pressed_escape(ks, prevKeys)) return "";
 
-            if (cardputer_keyboard::pressed_backspace(ks, prevKeys) ||
-                cardputer_keyboard::pressed_nav_left(ks, prevKeys)) {
+            if (cardputer_keyboard::pressed_backspace(ks, prevKeys)) {
                 int sl = curDir.lastIndexOf('/');
                 curDir = (sl > 0) ? curDir.substring(0, sl) : "/";
                 loadDir();
                 redraw = true;
             }
 
-            if (cardputer_keyboard::pressed_enter(ks, prevKeys) ||
-                cardputer_keyboard::pressed_nav_right(ks, prevKeys)) {
+            if (cardputer_keyboard::pressed_enter(ks, prevKeys)) {
                 if (!entries.empty()) {
                     const FsEntry& sel = entries[cursor];
                     if (sel.isDir) {
@@ -140,6 +185,16 @@ public:
                     }
                     redraw = true;
                 }
+            }
+
+            if (cardputer_keyboard::pressed_nav_left(ks, prevKeys)) {
+                _pageMove(-1, (int)entries.size(), cursor, scroll);
+                redraw = true;
+            }
+
+            if (cardputer_keyboard::pressed_nav_right(ks, prevKeys)) {
+                _pageMove(+1, (int)entries.size(), cursor, scroll);
+                redraw = true;
             }
 
             if (cardputer_keyboard::pressed_word_ci(ks, prevKeys, 'w') ||
@@ -180,6 +235,18 @@ public:
     }
 
 private:
+    static void _pageMove(int dir, int count, int& cursor, int& scroll)
+    {
+        if (count <= 0) return;
+        int maxCursor = count - 1;
+        cursor += dir * VISIBLE_ROWS;
+        if (cursor < 0) cursor = 0;
+        if (cursor > maxCursor) cursor = maxCursor;
+        scroll = (cursor / VISIBLE_ROWS) * VISIBLE_ROWS;
+        int maxScroll = std::max(0, count - VISIBLE_ROWS);
+        if (scroll > maxScroll) scroll = maxScroll;
+    }
+
     static void _draw(const std::vector<FsEntry>& e, const String& dir,
                       const char* title, int cur, int scr)
     {
@@ -235,16 +302,16 @@ private:
         d.fillRect(0, H-FOOT_H, W, FOOT_H, FS_FOOT_BG);
         d.setTextColor(FS_FOOT_TXT, FS_FOOT_BG);
         d.setCursor(2, H-FOOT_H+2);
-        d.print(";.:nav /:open ,:up ESC:cancel A-Z:jump");
+        d.print(";.:nav ,/:pg ENT:open BKSP:up ESC:x");
     }
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
-// CONFIG — lettura/scrittura /midi_player.cfg
+// CONFIG — read/write /Midi/midi_player.cfg
 // ═════════════════════════════════════════════════════════════════════════════
 
 struct PlayerConfig {
-    // Config read/write for /midi_player.cfg
+    // Config read/write for /Midi/midi_player.cfg
     String sf2Path   = "/gm.sf2";
     String midiPath  = "";
     int    audioMode = 1;   // 1=ES8311 2=I2S_DAC 3=PDM 4=PWM
@@ -259,6 +326,7 @@ static inline String _cfgVal(const String& line, const String& key) {
 inline PlayerConfig loadConfig() {
     PlayerConfig c;
     File f = SD.open(CFG_PATH, FILE_READ);
+    if (!f) f = SD.open(CFG_PATH_LEGACY, FILE_READ);
     if (!f) return c;
     while (f.available()) {
         String ln = f.readStringUntil('\n'); ln.trim();
@@ -269,18 +337,22 @@ inline PlayerConfig loadConfig() {
         if ((v = _cfgVal(ln, "mididx")).length())    c.midiIdx   = v.toInt();
     }
     f.close();
-    Serial.printf("[CFG] sf2=%s midi=%s mode=%d idx=%d\n",
+    Serial.printf("[CFG] sf2=%s midi=%s mode=%d idx=%d\r\n",
         c.sf2Path.c_str(), c.midiPath.c_str(), c.audioMode, c.midiIdx);
     return c;
 }
 
 inline void saveConfig(const PlayerConfig& c) {
+    if (!SD.exists(CFG_DIR) && !SD.mkdir(CFG_DIR)) {
+        Serial.printf("[CFG] Failed to create %s\r\n", CFG_DIR);
+        return;
+    }
     File f = SD.open(CFG_PATH, FILE_WRITE);
-    if (!f) { Serial.println("[CFG] Errore scrittura!"); return; }
+    if (!f) { Serial.println("[CFG] Write failed!"); return; }
     f.printf("sf2=%s\n",       c.sf2Path.c_str());
     f.printf("midi=%s\n",      c.midiPath.c_str());
     f.printf("audiomode=%d\n", c.audioMode);
     f.printf("mididx=%d\n",    c.midiIdx);
     f.close();
-    Serial.printf("[CFG] Salvato %s\n", CFG_PATH);
+    Serial.printf("[CFG] Saved %s\r\n", CFG_PATH);
 }

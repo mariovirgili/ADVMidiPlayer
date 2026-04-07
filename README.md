@@ -58,7 +58,7 @@ power off -> hold `G0` -> power on -> release `G0`.
 
 | # | Mode | Hz | Channels | Hardware |
 |---|---|---|---|---|
-| 1 | ADV built-in ES8311 | 44100 | Mono | 3.5mm jack + internal speaker |
+| 1 | ADV built-in ES8311 | 22050 | Mono | 3.5mm jack + internal speaker |
 | 2 | External I2S DAC | 22050 | Stereo | MAX98357A / PCM5102 |
 | 3 | PDM GPIO2 | 16000 | Mono | Cardputer built-in speaker |
 | 4 | PWM LEDC GPIO2 | 16000 | Mono | Cardputer built-in speaker |
@@ -128,7 +128,7 @@ Secondary volume aliases `+`, `=` and `-` are also accepted.
 
 ---
 
-## Automatic config (`/midi_player.cfg`)
+## Automatic config (`/Midi/midi_player.cfg`)
 
 ```ini
 sf2=/soundfonts/gm.sf2
@@ -138,5 +138,6 @@ mididx=0
 ```
 
 The config is saved automatically after every change. On the next boot, selectors start from the last used path.
+If `/Midi` does not exist on the SD card, it is created automatically.
 
-To reset it, delete `/midi_player.cfg` from the SD card.
+To reset it, delete `/Midi/midi_player.cfg` from the SD card.

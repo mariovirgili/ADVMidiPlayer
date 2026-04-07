@@ -301,9 +301,11 @@ static int tml_parsemessage(tml_message** f, struct tml_parser* p)
 	{
 		//start allocated memory size of message array at 64, double each time until 8192, then add 1024 entries until done
 		p->message_array_size += (!p->message_array_size ? 64 : (p->message_array_size > 4096 ? 1024 : p->message_array_size));
-		*f = (tml_message*)TML_REALLOC(*f, p->message_array_size * sizeof(tml_message));
-		if (!*f) { TML_ERROR("Out of memory"); return -1; }
+		tml_message* new_messages = (tml_message*)TML_REALLOC(*f, p->message_array_size * sizeof(tml_message));
+		if (!new_messages) { TML_ERROR("Out of memory"); return -1; }
+		*f = new_messages;
 	}
+	if (!*f || p->message_count < 0 || p->message_count >= p->message_array_size) { TML_ERROR("Invalid message buffer state"); return -1; }
 	evt = *f + p->message_count;
 
 	//check what message we have
@@ -396,10 +398,11 @@ TMLDEF tml_message* tml_load(struct tml_stream* stream)
 	if (midi_header[12] & 0x80) { TML_ERROR("File uses unsupported SMPTE timing"); return messages; }
 	num_tracks = (int)(midi_header[10] << 8) | midi_header[11];
 	division = (int)(midi_header[12] << 8) | midi_header[13]; //division is ticks per beat (quarter-note)
-	if (num_tracks <= 0 && division <= 0) { TML_ERROR("Doesn't look like a MIDI file: invalid track or division values"); return messages; }
+	if (num_tracks <= 0 || division <= 0) { TML_ERROR("Doesn't look like a MIDI file: invalid track or division values"); return messages; }
 
 	// Allocate temporary tracks array for parsing
 	tracks = (struct tml_track*)TML_MALLOC(sizeof(struct tml_track) * num_tracks);
+	if (!tracks) { TML_ERROR("Out of memory"); return messages; }
 	tracksEnd = &tracks[num_tracks];
 	for (t = tracks; t != tracksEnd; t++) t->Idx = t->End = t->Ticks = 0;
 
@@ -415,7 +418,12 @@ TMLDEF tml_message* tml_load(struct tml_stream* stream)
 		// Get size of track data and read into buffer (allocate bigger buffer if needed)
 		track_length = track_header[7] | (track_header[6] << 8) | (track_header[5] << 16) | (track_header[4] << 24);
 		if (track_length < 0) { TML_WARN("Invalid MTrk header"); break; }
-		if (trackbufsize < track_length) { TML_FREE(trackbuf); trackbuf = (unsigned char*)TML_MALLOC(trackbufsize = track_length); }
+		if (trackbufsize < track_length)
+		{
+			TML_FREE(trackbuf);
+			trackbuf = (unsigned char*)TML_MALLOC(trackbufsize = track_length);
+			if (!trackbuf) { TML_WARN("Out of memory allocating track buffer"); break; }
+		}
 		if (stream->read(stream->data, trackbuf, track_length) != track_length) { TML_WARN("Unexpected end of file"); break; }
 
 		t->Idx = p.message_count;
@@ -430,7 +438,7 @@ TMLDEF tml_message* tml_load(struct tml_stream* stream)
 	TML_FREE(trackbuf);
 
 	// Change message time signature from delta ticks to actual msec values and link messages ordered by time
-	if (p.message_count)
+	if (p.message_count && messages)
 	{
 		tml_message *PrevMessage = TML_NULL, *Msg, *MsgEnd, Swap;
 		unsigned int ticks = 0, tempo_ticks = 0; //tick counter and value at last tempo change
