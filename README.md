@@ -1,5 +1,5 @@
 # GM MIDI Player - M5Stack Cardputer ADV
-### PlatformIO firmware for MIDI playback with SF2 soundfonts, SD browser, runtime menu, and persistent settings
+### PlatformIO firmware for MIDI playback with SF2 soundfonts, SD browser, single/dual display UI, runtime menu, and persistent settings
 
 ---
 
@@ -10,6 +10,7 @@ This project turns the **M5Stack Cardputer ADV** into a **General MIDI player** 
 - loads **SF2 soundfonts** from the SD card
 - plays **`.mid` / `.midi`** files from the SD card
 - shows a **16-channel live monitor** during playback
+- supports both **single-display** and **dual-display** workflows
 - supports **multiple audio outputs**
 - keeps the latest **audio mode / soundfont / MIDI selection** across reboots
 - includes an **embedded boot splash image**
@@ -22,6 +23,7 @@ The firmware is designed for the **Cardputer ADV without PSRAM**, so it focuses 
 
 - **Interactive boot flow**
   - embedded splash screen shown at boot
+  - display mode selection: `Single display` or `Dual display`
   - audio output selection menu
   - SF2 selection
   - MIDI selection
@@ -59,6 +61,11 @@ The firmware is designed for the **Cardputer ADV without PSRAM**, so it focuses 
   - scrolling title marquee for long file names
   - partial redraws to reduce flicker
   - progress bar and elapsed/total time
+  - in dual display mode:
+    - the **external TFT** shows the live 16-channel monitor
+    - the **internal Cardputer display** stays on the MIDI list/browser
+    - the internal first row shows track index, `Vol` and battery level
+    - if playback stays stopped long enough to return to the boot splash, the external TFT is blanked
 
 - **Idle behavior**
   - if playback stays stopped for more than **5 seconds**, the splash image is shown again
@@ -130,6 +137,7 @@ This firmware targets a **no-PSRAM** Cardputer ADV, so memory handling matters.
 Practical recommendations:
 
 - prefer **small or very small soundfonts** for the built-in audio path
+- for the built-in ES8311 output, a lightweight default such as **`Super Small Font.sf2`** from **Polyphone.io** is strongly recommended
 - use the **external I2S DAC** mode if you want the least compromise
 - very large or dense MIDI files can still be heavier than simple GM files
 
@@ -151,6 +159,29 @@ Practical recommendations:
 | `M` | Open runtime menu |
 
 Secondary volume aliases `+`, `=` and `-` are also accepted.
+
+### Dual display mode
+
+When `Dual display` is selected after boot:
+
+- the **external TFT** becomes the playback monitor
+- the **internal display** remains focused on the MIDI file list
+- the currently highlighted file on the internal list can be started directly
+
+Controls in dual display mode:
+
+| Key | Action |
+|---|---|
+| `SPACE` | Play / Pause |
+| `;` | Select previous MIDI in the internal list |
+| `.` | Select next MIDI in the internal list |
+| `,` | Previous page in the internal list |
+| `/` | Next page in the internal list |
+| `ENTER` | Play highlighted MIDI |
+| `-` | Volume down (-3 dB) |
+| `=` / `+` | Volume up (+3 dB) |
+| `L` | Toggle loop |
+| `M` | Open runtime menu |
 
 ### Runtime menu
 
@@ -209,7 +240,7 @@ Notes:
 - `COM4` for upload and monitor
 - `dio` flash mode
 - `utf-8` serial monitor encoding
-- `921600` upload speed in PlatformIO
+- `460800` upload speed
 
 Standard commands:
 
@@ -290,4 +321,3 @@ ADVMidiPlayer/
 - Config persistence: **enabled**
 - Runtime menu: **enabled**
 - Embedded splash: **enabled**
-
