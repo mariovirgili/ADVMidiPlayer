@@ -20,7 +20,15 @@
   <img src="media/ScreenTitle_boot.jpg" alt="Boot splash" width="32%">
 </p>
 
-Demo video: [media/video.mp4](media/video.mp4)
+<p align="center">
+  <a href="media/video.mp4">
+    <img src="media/video_preview.gif" alt="Demo video preview" width="32%">
+  </a>
+</p>
+
+<p align="center">
+  Click the GIF preview to open the full demo video.
+</p>
 
 ---
 
