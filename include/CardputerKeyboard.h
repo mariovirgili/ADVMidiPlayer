@@ -48,6 +48,21 @@ inline bool pressed_hid(const KeysState& cur, const KeysState& prev, uint8_t hid
     return has_hid(cur, hid) && !has_hid(prev, hid);
 }
 
+inline bool state_changed(const KeysState& cur, const KeysState& prev) {
+    return cur.tab != prev.tab
+        || cur.fn != prev.fn
+        || cur.shift != prev.shift
+        || cur.ctrl != prev.ctrl
+        || cur.opt != prev.opt
+        || cur.alt != prev.alt
+        || cur.del != prev.del
+        || cur.enter != prev.enter
+        || cur.space != prev.space
+        || cur.hid_keys != prev.hid_keys
+        || cur.word != prev.word
+        || cur.modifier_keys != prev.modifier_keys;
+}
+
 inline bool pressed_fn_hid(const KeysState& cur, const KeysState& prev, uint8_t hid) {
     bool active_now  = cur.fn  && has_hid(cur, hid);
     bool active_prev = prev.fn && has_hid(prev, hid);

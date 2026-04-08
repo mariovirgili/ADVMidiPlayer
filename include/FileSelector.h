@@ -159,9 +159,11 @@ public:
         while (true) {
             if (redraw) { _draw(entries, curDir, title, cursor, scroll); redraw = false; }
             M5Cardputer.update();
-            if (!M5Cardputer.Keyboard.isChange()) { delay(5); continue; }
 
             auto ks = M5Cardputer.Keyboard.keysState();
+            bool kbChanged = M5Cardputer.Keyboard.isChange()
+                          || cardputer_keyboard::state_changed(ks, prevKeys);
+            if (!kbChanged) { delay(5); continue; }
 
             if (cardputer_keyboard::pressed_escape(ks, prevKeys)) return "";
 

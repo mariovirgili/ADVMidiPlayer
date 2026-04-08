@@ -1309,7 +1309,7 @@ static void playerUiStep() {
         }
         Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
       }
-      if (c == 'm' || c == 'M') { openFileSelector(); break; }
+      if (c == 'm' || c == 'M' || c == 'f' || c == 'F') { openFileSelector(); break; }
     }
 
     prevKeys = ks;
@@ -2131,9 +2131,11 @@ static AudioMode selectAudioMode(int saved) {
       d.drawRoundRect(2, y, 236, rowH-1, 3,
                       blink ? opts[sel].col : (uint16_t)0x0318);
     }
-    if (!M5Cardputer.Keyboard.isChange()) { delay(5); continue; }
 
     auto ks = M5Cardputer.Keyboard.keysState();
+    bool kbChanged = M5Cardputer.Keyboard.isChange()
+                  || cardputer_keyboard::state_changed(ks, prevKeys);
+    if (!kbChanged) { delay(5); continue; }
     if (!ks.fn) {
       for (int i = 0; i < N; i++) {
         if (cardputer_keyboard::pressed_digit(ks, prevKeys, static_cast<char>('1' + i))) {
@@ -2286,9 +2288,11 @@ static void openFileSelector() {
   cardputer_keyboard::KeysState prevKeys{};
   while (!choice) {
     M5Cardputer.update();
-    if (!M5Cardputer.Keyboard.isChange()) { delay(5); continue; }
 
     auto ks = M5Cardputer.Keyboard.keysState();
+    bool kbChanged = M5Cardputer.Keyboard.isChange()
+                  || cardputer_keyboard::state_changed(ks, prevKeys);
+    if (!kbChanged) { delay(5); continue; }
     if (!ks.fn) {
       if (cardputer_keyboard::pressed_digit(ks, prevKeys, '1')) choice = 1;
       if (cardputer_keyboard::pressed_digit(ks, prevKeys, '2')) choice = 2;
@@ -2311,7 +2315,7 @@ static void openFileSelector() {
     }
     if (!choice && (cardputer_keyboard::pressed_escape(ks, prevKeys) ||
                     cardputer_keyboard::pressed_nav_left(ks, prevKeys))) {
-      choice = 3;
+      choice = 4;
     }
     prevKeys = ks;
     delay(5);
