@@ -102,6 +102,12 @@ VCC    ----> 3.3V
 
 Only the **external I2S DAC** path is stereo. Internal Cardputer outputs are mono.
 
+Important for the `dualdisplay` branch:
+
+- the **External I2S DAC** mode is **not available together with Dual display**
+- the external TFT wiring used by the dual-display configuration conflicts with the GPIOs used by the external DAC path
+- if you want to use the external DAC, select **Single display**
+
 ---
 
 ## SD card layout
@@ -167,6 +173,7 @@ When `Dual display` is selected after boot:
 - the **external TFT** becomes the playback monitor
 - the **internal display** remains focused on the MIDI file list
 - the currently highlighted file on the internal list can be started directly
+- the **External I2S DAC** option must not be used in this mode; use the built-in audio path instead
 
 Controls in dual display mode:
 

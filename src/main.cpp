@@ -252,6 +252,7 @@ static const char* const GM_NAMES[128] = {
 
 struct ChannelInfo {
   bool     active    = false;
+  bool     labelVisible = false;
   uint8_t  program   = 0;
   uint8_t  note      = 0;
   uint8_t  velocity  = 0;
@@ -1013,6 +1014,7 @@ static void midiProcessEvent(const MidiEvent& evt) {
 
     case TML_NOTE_ON:
       if (evt.b > 0) {
+        g_ch[ch].labelVisible = true;
         g_ch[ch].note       = evt.a;
         g_ch[ch].velocity   = evt.b;
         g_ch[ch].active     = true;
@@ -1972,6 +1974,7 @@ static void tickMidi(double deltaMs) {
 
       case TML_NOTE_ON:
         if (g_midiCur->velocity > 0) {
+          g_ch[ch].labelVisible = true;
           g_ch[ch].note      = (uint8_t)g_midiCur->key;
           g_ch[ch].velocity  = (uint8_t)g_midiCur->velocity;
           g_ch[ch].active    = true;
@@ -2187,10 +2190,12 @@ static void drawExternalChannelRow(int ch) {
   g_extTft->drawCentreString(String(ch + 1), x + 11, y + 4, 2);
 
   g_extTft->setTextColor(active ? TFT_WHITE : TFT_LIGHTGREY, rowBg);
-  char nb[10] = {};
-  const char* nm = drum ? "DrumKit" : (ci.program < 128 ? GM_NAMES[ci.program] : "---");
-  strncpy(nb, nm, 9);
-  g_extTft->drawString(nb, x + 26, y + 4, 2);
+  if (ci.labelVisible) {
+    char nb[10] = {};
+    const char* nm = drum ? "DrumKit" : (ci.program < 128 ? GM_NAMES[ci.program] : "---");
+    strncpy(nb, nm, 9);
+    g_extTft->drawString(nb, x + 26, y + 4, 2);
+  }
 
   int rx = x + 88;
   g_extTft->fillRect(rx, y + 4, 42, rowH - 8, TFT_NAVY);
@@ -2332,7 +2337,7 @@ static void drawChannelRow(int ch) {
   // Nome strumento
   d.setTextColor(active ? C_TEXT : C_DIM, rowBg);
   d.setCursor(x + 15, y + 3);
-  {
+  if (ci.labelVisible) {
     char nb[9] = {};
     const char* nm = drum ? "DrumKit"
                           : (ci.program < 128 ? GM_NAMES[ci.program] : "---");
