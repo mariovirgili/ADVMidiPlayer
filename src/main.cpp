@@ -371,6 +371,8 @@ static uint32_t     g_lastDualHeaderTotalSec   = UINT32_MAX;
 static int          g_lastDualHeaderMidiIdx    = -1;
 static bool         g_lastDualHeaderPlaying    = false;
 static bool         g_lastDualHeaderLooping    = false;
+static int          g_lastDualVolumeDb         = 127;
+static int          g_lastDualBatteryPct       = -2;
 static int          g_lastDualListCursor       = -1;
 static int          g_lastDualListScroll       = -1;
 static int          g_lastDualCurrentMidiIdx   = -1;
@@ -574,6 +576,8 @@ static void syncDualListCache(void) {
   g_lastDualHeaderMidiIdx    = g_midiIdx;
   g_lastDualHeaderPlaying    = g_playing;
   g_lastDualHeaderLooping    = g_looping;
+  g_lastDualVolumeDb         = (int)g_vol_dB;
+  g_lastDualBatteryPct       = g_dualBatteryPct;
   g_lastDualListCursor       = g_dualListCursor;
   g_lastDualListScroll       = g_dualListScroll;
   g_lastDualCurrentMidiIdx   = g_midiIdx;
@@ -604,6 +608,8 @@ static void invalidateUiCache(void) {
   g_lastDualHeaderMidiIdx    = -1;
   g_lastDualHeaderPlaying    = !g_playing;
   g_lastDualHeaderLooping    = !g_looping;
+  g_lastDualVolumeDb         = 127;
+  g_lastDualBatteryPct       = -2;
   g_lastDualListCursor       = -1;
   g_lastDualListScroll       = -1;
   g_lastDualCurrentMidiIdx   = -1;
@@ -1355,7 +1361,6 @@ static void playerUiStep() {
       if (batt > 100) batt = 100;
       if (batt != g_dualBatteryPct) {
         g_dualBatteryPct = batt;
-        g_dualListDirty = true;
         g_needRedraw = true;
       }
       g_dualBatteryPollMs = now;
@@ -1480,7 +1485,6 @@ static void playerUiStep() {
           tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
           xSemaphoreGive(g_tsfMutex);
         }
-        g_dualListDirty = true;
         g_needRedraw = true;
         Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
       } else if (cardputer_keyboard::pressed_nav_down(ks, prevKeys)) {
@@ -1490,7 +1494,6 @@ static void playerUiStep() {
           tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
           xSemaphoreGive(g_tsfMutex);
         }
-        g_dualListDirty = true;
         g_needRedraw = true;
         Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
       }
@@ -1498,7 +1501,7 @@ static void playerUiStep() {
 
     for (char c : ks.word) {
       if (c == 'r' || c == 'R') { loadMidi(g_midiIdx); break; }
-      if (c == 'l' || c == 'L') { g_looping = !g_looping; g_needRedraw = true; g_dualListDirty = true; }
+      if (c == 'l' || c == 'L') { g_looping = !g_looping; g_needRedraw = true; }
       if (c == '+' || c == '=') {
         g_vol_dB = (g_vol_dB + 3.0f < 0.0f) ? g_vol_dB + 3.0f : 0.0f;
         if (g_tsf) {
@@ -1506,7 +1509,6 @@ static void playerUiStep() {
           tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
           xSemaphoreGive(g_tsfMutex);
         }
-        g_dualListDirty = true;
         g_needRedraw = true;
         Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
       }
@@ -1517,7 +1519,6 @@ static void playerUiStep() {
           tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
           xSemaphoreGive(g_tsfMutex);
         }
-        g_dualListDirty = true;
         g_needRedraw = true;
         Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
       }
@@ -2117,6 +2118,26 @@ static void drawDualMidiListFull() {
   g_dualListDirty = false;
 }
 
+static void drawDualMidiListHeader() {
+  auto& d = M5Cardputer.Display;
+  constexpr int hdrH = 13;
+  d.startWrite();
+  d.fillRect(0, 0, 240, hdrH, C_HDR_BG);
+  d.setTextColor(C_TEXT, C_HDR_BG);
+  d.setTextSize(1);
+  d.setCursor(2, 2);
+  d.print(g_playing ? "\x10 " : "|| ");
+  d.print(g_looping ? "[L] " : "    ");
+  d.print("Dual MIDI");
+  char info[32];
+  buildDualListHeaderInfoText(info, sizeof(info));
+  int infoX = 240 - (int)strlen(info) * 6 - 2;
+  d.setCursor(infoX, 2);
+  d.print(info);
+  d.endWrite();
+  syncDualListCache();
+}
+
 static void drawExternalHeader() {
   if (!g_extDisplayReady || !g_extTft) return;
   g_extTft->fillRect(0, 0, EXT_LCD_W, 18, TFT_NAVY);
@@ -2399,14 +2420,19 @@ static void redrawFull() {
 
 static void redrawPartial() {
   if (useDualDisplay()) {
+    bool dualListStateDirty = g_lastDualListCursor       != g_dualListCursor
+                           || g_lastDualListScroll       != g_dualListScroll
+                           || g_lastDualCurrentMidiIdx   != g_midiIdx
+                           || g_lastDualHeaderPlaying    != g_playing;
     bool dualHeaderDirty = g_lastDualHeaderMidiIdx    != g_midiIdx
                         || g_lastDualHeaderPlaying    != g_playing
                         || g_lastDualHeaderLooping    != g_looping
-                        || g_lastDualListCursor       != g_dualListCursor
-                        || g_lastDualListScroll       != g_dualListScroll
-                        || g_lastDualCurrentMidiIdx   != g_midiIdx;
-    if (g_dualListDirty || dualHeaderDirty) {
+                        || g_lastDualVolumeDb         != (int)g_vol_dB
+                        || g_lastDualBatteryPct       != g_dualBatteryPct;
+    if (g_dualListDirty || dualListStateDirty) {
       drawDualMidiListFull();
+    } else if (dualHeaderDirty) {
+      drawDualMidiListHeader();
     }
     redrawExternalMonitorPartial();
     g_dirtyChannelMask = 0;
