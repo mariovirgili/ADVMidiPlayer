@@ -12,6 +12,7 @@
  * Config salvata su SD in /Midi/midi_player.cfg:
  *   sf2=/path/file.sf2
  *   midi=/path/file.mid
+ *   displaymode=0
  *   audiomode=1
  *   mididx=0
  */
@@ -316,6 +317,7 @@ struct PlayerConfig {
     // Config read/write for /Midi/midi_player.cfg
     String sf2Path   = "/gm.sf2";
     String midiPath  = "";
+    int    displayMode = 0; // 0=single internal display, 1=dual display
     int    audioMode = 1;   // 1=ES8311 2=I2S_DAC 3=PDM 4=PWM
     int    midiIdx   = 0;
 };
@@ -335,12 +337,13 @@ inline PlayerConfig loadConfig() {
         String v;
         if ((v = _cfgVal(ln, "sf2")).length())       c.sf2Path   = v;
         if ((v = _cfgVal(ln, "midi")).length())      c.midiPath  = v;
+        if ((v = _cfgVal(ln, "displaymode")).length()) c.displayMode = v.toInt();
         if ((v = _cfgVal(ln, "audiomode")).length()) c.audioMode = v.toInt();
         if ((v = _cfgVal(ln, "mididx")).length())    c.midiIdx   = v.toInt();
     }
     f.close();
-    Serial.printf("[CFG] sf2=%s midi=%s mode=%d idx=%d\r\n",
-        c.sf2Path.c_str(), c.midiPath.c_str(), c.audioMode, c.midiIdx);
+    Serial.printf("[CFG] sf2=%s midi=%s dmode=%d mode=%d idx=%d\r\n",
+        c.sf2Path.c_str(), c.midiPath.c_str(), c.displayMode, c.audioMode, c.midiIdx);
     return c;
 }
 
@@ -353,6 +356,7 @@ inline void saveConfig(const PlayerConfig& c) {
     if (!f) { Serial.println("[CFG] Write failed!"); return; }
     f.printf("sf2=%s\n",       c.sf2Path.c_str());
     f.printf("midi=%s\n",      c.midiPath.c_str());
+    f.printf("displaymode=%d\n", c.displayMode);
     f.printf("audiomode=%d\n", c.audioMode);
     f.printf("mididx=%d\n",    c.midiIdx);
     f.close();

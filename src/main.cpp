@@ -34,6 +34,7 @@
 
 #include <Arduino.h>
 #include <M5Cardputer.h>
+#include <TFT_eSPI.h>
 #include <SD.h>
 #include <SPI.h>
 #include <driver/i2s.h>
@@ -43,6 +44,7 @@
 #include <freertos/semphr.h>
 #include <vector>
 #include <algorithm>
+#include <memory>
 
 // ── TinySoundFont ─────────────────────────────────────────────────────────────
 #define TSF_NO_STDIO
@@ -99,10 +101,17 @@ enum AudioMode {
   AUDIO_PWM     = 4
 };
 
+enum DisplayMode {
+  DISPLAY_SINGLE = 0,
+  DISPLAY_DUAL   = 1
+};
+
 static AudioMode g_audioMode  = AUDIO_NONE;
+static DisplayMode g_displayMode = DISPLAY_SINGLE;
 static uint32_t  g_sampleRate = 22050;
 static i2s_port_t g_i2sPort   = I2S_NUM_0;
 static bool       g_audioReady = false;
+static bool       g_extDisplayReady = false;
 
 #define CHUNK_FRAMES  256
 #define ES8311_CHUNK_FRAMES 1024
@@ -115,6 +124,13 @@ static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 3;
 static constexpr size_t ES8311_QUEUE_BUFFERS = 3;
 static constexpr uint32_t MIDI_RAM_HEADROOM = 96 * 1024;
 static constexpr uint32_t IDLE_SPLASH_DELAY_MS = 5000;
+static constexpr uint32_t SINGLE_UI_REFRESH_MS = 66;
+static constexpr uint32_t DUAL_UI_REFRESH_MS = 100;
+static constexpr uint32_t DUAL_INPUT_POLL_US = 8000;
+static constexpr bool PERF_LOG_ENABLED = false;
+static constexpr int EXT_LCD_W = 320;
+static constexpr int EXT_LCD_H = 240;
+static constexpr int DUAL_LIST_ROWS = 10;
 enum : uint8_t {
   ES8311_BUF_EMPTY  = 0,
   ES8311_BUF_READY  = 1,
@@ -135,7 +151,8 @@ extern const uint8_t kBootSplashJpgEnd[]   asm("_binary_media_ScreenTitle_boot_j
 static volatile uint32_t g_pwmIdx  = 0;
 static volatile bool     g_pwmDone = false;
 static hw_timer_t*       g_pwmTimer = nullptr;
-static SPIClass          g_spiSD(HSPI);
+static SPIClass&         g_spiSD = SPI;
+static std::unique_ptr<TFT_eSPI> g_extTft;
 
 static bool loadMidi(int idx);
 static void tickMidi(double deltaMs);
@@ -147,9 +164,19 @@ static void setPlaybackState(bool playing);
 static void showBootSplashImage(uint32_t holdMs);
 static void shutdownAudio();
 static void saveCurrentMidiConfig(int idx);
+static bool initExternalDisplay();
+static DisplayMode selectDisplayMode(int saved);
+static void syncDualListSelectionToCurrent();
+static void dualListPageMove(int dir);
+static void blankExternalMonitor();
+static const char* audioModeShortLabel(AudioMode mode);
 
 static inline bool useStereoSynthOutput() {
   return g_audioMode == AUDIO_I2S_DAC;
+}
+
+static inline bool useDualDisplay() {
+  return g_displayMode == DISPLAY_DUAL && g_extDisplayReady;
 }
 
 static inline enum TSFOutputMode currentSynthOutputMode() {
@@ -312,7 +339,7 @@ static std::vector<String> g_midiList;
 static int          g_midiIdx  = 0;
 static bool         g_playing  = false;
 static bool         g_looping  = false;
-static float        g_vol_dB   = 0.0f;
+static float        g_vol_dB   = -15.0f;
 
 static ChannelInfo  g_ch[16];
 static bool         g_fullRedraw = true;
@@ -333,6 +360,27 @@ static uint32_t     g_trackAdvanceAtMs     = 0;
 static uint32_t     g_lastPlaybackActivityMs = 0;
 static bool         g_idleSplashActive = false;
 static PerfWindow   g_perf;
+static int          g_dualListCursor = 0;
+static int          g_dualListScroll = 0;
+static bool         g_dualListDirty  = true;
+static int          g_dualBatteryPct = -1;
+static uint32_t     g_dualBatteryPollMs = 0;
+static uint32_t     g_lastDualHeaderElapsedSec = UINT32_MAX;
+static uint32_t     g_lastDualHeaderTotalSec   = UINT32_MAX;
+static int          g_lastDualHeaderMidiIdx    = -1;
+static bool         g_lastDualHeaderPlaying    = false;
+static bool         g_lastDualHeaderLooping    = false;
+static int          g_lastDualListCursor       = -1;
+static int          g_lastDualListScroll       = -1;
+static int          g_lastDualCurrentMidiIdx   = -1;
+static uint32_t     g_extLastHeaderElapsedSec  = UINT32_MAX;
+static uint32_t     g_extLastHeaderTotalSec    = UINT32_MAX;
+static int          g_extLastHeaderMidiIdx     = -1;
+static bool         g_extLastHeaderPlaying     = false;
+static bool         g_extLastHeaderLooping     = false;
+static int          g_extLastProgressW         = -1;
+static uint32_t     g_extLastHeaderTitleScroll = UINT32_MAX;
+static bool         g_extPausedBlank           = false;
 
 static PlayerConfig g_cfg;
 static File         g_sf2File;
@@ -342,6 +390,7 @@ static size_t       g_midiDataSize = 0;
 static bool         g_midiFromRam = false;
 
 static void perfReset(uint32_t nowMs) {
+  if (!PERF_LOG_ENABLED) return;
   memset(&g_perf, 0, sizeof(g_perf));
   g_perf.startedMs = nowMs;
 }
@@ -355,6 +404,7 @@ static bool keysStateHasAnyInput(const cardputer_keyboard::KeysState& ks) {
 }
 
 static void perfMaybeLog(void) {
+  if (!PERF_LOG_ENABLED) return;
   uint32_t now = millis();
   if (g_perf.startedMs == 0) {
     perfReset(now);
@@ -420,15 +470,18 @@ static inline int currentProgressWidth(void) {
   return 0;
 }
 
-static String currentTrackTitle(void) {
-  if (g_midiList.empty()) return "";
-
-  String fname = g_midiList[g_midiIdx];
+static String trackTitleFromPath(const String& path) {
+  String fname = path;
   int sl = fname.lastIndexOf('/');
   if (sl >= 0) fname = fname.substring(sl + 1);
   int dt = fname.lastIndexOf('.');
   if (dt > 0) fname = fname.substring(0, dt);
   return fname;
+}
+
+static String currentTrackTitle(void) {
+  if (g_midiList.empty()) return "";
+  return trackTitleFromPath(g_midiList[g_midiIdx]);
 }
 
 static void buildHeaderInfoText(char* info, size_t infoSize) {
@@ -442,6 +495,16 @@ static void buildHeaderInfoText(char* info, size_t infoSize) {
     snprintf(info, infoSize, "%2d/%d %u:%02u/--:--",
              g_midiIdx + 1, (int)g_midiList.size(),
              el / 60, el % 60);
+  }
+}
+
+static void buildDualListHeaderInfoText(char* info, size_t infoSize) {
+  if (g_dualBatteryPct >= 0) {
+    snprintf(info, infoSize, "%2d/%d Vol%+d B%d%%",
+             g_midiIdx + 1, (int)g_midiList.size(), (int)g_vol_dB, g_dualBatteryPct);
+  } else {
+    snprintf(info, infoSize, "%2d/%d Vol%+d B--",
+             g_midiIdx + 1, (int)g_midiList.size(), (int)g_vol_dB);
   }
 }
 
@@ -460,16 +523,9 @@ static uint32_t currentHeaderTitleScrollIndex(void) {
   return (millis() / 250) % (uint32_t)(title.length() + 3);
 }
 
-static String currentHeaderTitleWindow(void) {
+static String currentTrackTitleWindowForChars(int visibleChars) {
   String title = currentTrackTitle();
   if (title.isEmpty()) return title;
-
-  char info[26];
-  buildHeaderInfoText(info, sizeof(info));
-  int infoX = 240 - (int)strlen(info) * 6 - 2;
-  int titleX = 38;
-  int titleW = infoX - titleX - 4;
-  int visibleChars = titleW / 6;
   if (visibleChars <= 0) return "";
   if ((int)title.length() <= visibleChars) return title;
 
@@ -483,6 +539,24 @@ static String currentHeaderTitleWindow(void) {
   return out;
 }
 
+static String currentTrackTitleClipForChars(int visibleChars) {
+  String title = currentTrackTitle();
+  if (title.isEmpty()) return title;
+  if (visibleChars <= 0) return "";
+  if ((int)title.length() <= visibleChars) return title;
+  if (visibleChars <= 1) return title.substring(0, visibleChars);
+  return title.substring(0, visibleChars - 1) + "~";
+}
+
+static String currentHeaderTitleWindow(void) {
+  char info[26];
+  buildHeaderInfoText(info, sizeof(info));
+  int infoX = 240 - (int)strlen(info) * 6 - 2;
+  int titleX = 38;
+  int titleW = infoX - titleX - 4;
+  return currentTrackTitleWindowForChars(titleW / 6);
+}
+
 static void syncUiCache(void) {
   g_lastHeaderElapsedSec = (uint32_t)(g_midiMs / 1000.0);
   g_lastHeaderTotalSec   = g_songDurMs / 1000;
@@ -493,6 +567,29 @@ static void syncUiCache(void) {
   g_lastHeaderTitleScroll = currentHeaderTitleScrollIndex();
 }
 
+static void syncDualListCache(void) {
+  g_lastDualHeaderElapsedSec = (uint32_t)(g_midiMs / 1000.0);
+  g_lastDualHeaderTotalSec   = g_songDurMs / 1000;
+  g_lastDualHeaderMidiIdx    = g_midiIdx;
+  g_lastDualHeaderPlaying    = g_playing;
+  g_lastDualHeaderLooping    = g_looping;
+  g_lastDualListCursor       = g_dualListCursor;
+  g_lastDualListScroll       = g_dualListScroll;
+  g_lastDualCurrentMidiIdx   = g_midiIdx;
+}
+
+static void syncExternalUiCache(void) {
+  g_extLastHeaderElapsedSec  = (uint32_t)(g_midiMs / 1000.0);
+  g_extLastHeaderTotalSec    = g_songDurMs / 1000;
+  g_extLastHeaderMidiIdx     = g_midiIdx;
+  g_extLastHeaderPlaying     = g_playing;
+  g_extLastHeaderLooping     = g_looping;
+  g_extLastProgressW         = (g_songDurMs > 0 && g_midiMs > 0.0)
+                             ? std::min(EXT_LCD_W, (int)(EXT_LCD_W * g_midiMs / (double)g_songDurMs))
+                             : 0;
+  g_extLastHeaderTitleScroll = currentHeaderTitleScrollIndex();
+}
+
 static void invalidateUiCache(void) {
   g_lastHeaderElapsedSec = UINT32_MAX;
   g_lastHeaderTotalSec   = UINT32_MAX;
@@ -501,7 +598,41 @@ static void invalidateUiCache(void) {
   g_lastHeaderLooping    = !g_looping;
   g_lastProgressW        = -1;
   g_lastHeaderTitleScroll = UINT32_MAX;
+  g_lastDualHeaderElapsedSec = UINT32_MAX;
+  g_lastDualHeaderTotalSec   = UINT32_MAX;
+  g_lastDualHeaderMidiIdx    = -1;
+  g_lastDualHeaderPlaying    = !g_playing;
+  g_lastDualHeaderLooping    = !g_looping;
+  g_lastDualListCursor       = -1;
+  g_lastDualListScroll       = -1;
+  g_lastDualCurrentMidiIdx   = -1;
+  g_dualListDirty            = true;
+  g_extLastHeaderElapsedSec  = UINT32_MAX;
+  g_extLastHeaderTotalSec    = UINT32_MAX;
+  g_extLastHeaderMidiIdx     = -1;
+  g_extLastHeaderPlaying     = !g_playing;
+  g_extLastHeaderLooping     = !g_looping;
+  g_extLastProgressW         = -1;
+  g_extLastHeaderTitleScroll = UINT32_MAX;
   markAllChannelsDirty();
+}
+
+static void syncDualListSelectionToCurrent(void) {
+  int count = (int)g_midiList.size();
+  if (count <= 0) {
+    g_dualListCursor = 0;
+    g_dualListScroll = 0;
+    g_dualListDirty = true;
+    return;
+  }
+
+  if (g_midiIdx < 0) g_midiIdx = 0;
+  if (g_midiIdx >= count) g_midiIdx = count - 1;
+  g_dualListCursor = g_midiIdx;
+  g_dualListScroll = (g_dualListCursor / DUAL_LIST_ROWS) * DUAL_LIST_ROWS;
+  int maxScroll = std::max(0, count - DUAL_LIST_ROWS);
+  if (g_dualListScroll > maxScroll) g_dualListScroll = maxScroll;
+  g_dualListDirty = true;
 }
 
 static void queueNextTrackAdvance(void) {
@@ -1041,6 +1172,10 @@ static bool initAudio() {
     }
 
     case AUDIO_I2S_DAC: {
+      if (g_displayMode == DISPLAY_DUAL) {
+        Serial.println("[AUDIO] External I2S DAC is unavailable in dual-display mode");
+        return false;
+      }
       g_sampleRate = 22050;
       g_i2sPort = I2S_NUM_0;
       i2s_config_t c{};
@@ -1191,17 +1326,44 @@ static void audioTask(void*) {
 static void playerUiStep() {
   static cardputer_keyboard::KeysState prevKeys{};
   static uint32_t uiCallN = 0;
+  static uint32_t lastDevicePollUs = 0;
 
   static uint32_t updDbgN = 0;
   ++updDbgN;
-  M5Cardputer.update();
-  bool isChg = M5Cardputer.Keyboard.isChange();
+  uint32_t nowUs = micros();
+  bool didPoll = true;
+  if (useDualDisplay()) {
+    uint32_t sincePoll = nowUs - lastDevicePollUs;
+    if (lastDevicePollUs != 0 && sincePoll < DUAL_INPUT_POLL_US) {
+      didPoll = false;
+    }
+  }
+  if (didPoll) {
+    M5Cardputer.update();
+    lastDevicePollUs = nowUs;
+  }
+  bool isChg = didPoll ? M5Cardputer.Keyboard.isChange() : false;
   auto ks    = M5Cardputer.Keyboard.keysState();
   uint32_t now = millis();
+
+  if (useDualDisplay()) {
+    if (g_dualBatteryPct < 0 || (uint32_t)(now - g_dualBatteryPollMs) >= 5000) {
+      int batt = M5Cardputer.Power.getBatteryLevel();
+      if (batt < 0) batt = 0;
+      if (batt > 100) batt = 100;
+      if (batt != g_dualBatteryPct) {
+        g_dualBatteryPct = batt;
+        g_dualListDirty = true;
+        g_needRedraw = true;
+      }
+      g_dualBatteryPollMs = now;
+    }
+  }
 
   if (g_idleSplashActive) {
     if (isChg || keysStateHasAnyInput(ks)) {
       g_idleSplashActive = false;
+      g_extPausedBlank = false;
       g_lastPlaybackActivityMs = now;
       g_lastUiMs = now;
       invalidateUiCache();
@@ -1218,16 +1380,25 @@ static void playerUiStep() {
           && g_lastPlaybackActivityMs != 0
           && (uint32_t)(now - g_lastPlaybackActivityMs) >= IDLE_SPLASH_DELAY_MS) {
     showBootSplashImage(0);
+    if (useDualDisplay()) {
+      blankExternalMonitor();
+    }
     g_idleSplashActive = true;
     g_lastUiMs = now;
     prevKeys = ks;
     return;
   }
 
-  uint32_t nowUs = micros();
+  nowUs = micros();
   uint32_t deltaUs = nowUs - g_lastTickUs;
   g_lastTickUs = nowUs;
-  if (currentHeaderTitleScrollIndex() != g_lastHeaderTitleScroll) {
+  uint32_t titleScroll = currentHeaderTitleScrollIndex();
+  if (useDualDisplay()) {
+    if (titleScroll != g_extLastHeaderTitleScroll) g_needRedraw = true;
+    if (g_lastDualHeaderElapsedSec != (uint32_t)(g_midiMs / 1000.0)) g_needRedraw = true;
+  } else if (titleScroll != g_lastHeaderTitleScroll) {
+    g_needRedraw = true;
+  } else if (g_lastHeaderElapsedSec != (uint32_t)(g_midiMs / 1000.0)) {
     g_needRedraw = true;
   }
 
@@ -1262,35 +1433,70 @@ static void playerUiStep() {
       setPlaybackState(!g_playing);
     }
 
-    if (cardputer_keyboard::pressed_nav_right(ks, prevKeys)) {
-      g_midiIdx = (g_midiIdx + 1) % (int)g_midiList.size();
-      saveCurrentMidiConfig(g_midiIdx);
-      loadMidi(g_midiIdx);
-    } else if (cardputer_keyboard::pressed_nav_left(ks, prevKeys)) {
-      g_midiIdx = (g_midiIdx - 1 + (int)g_midiList.size()) % (int)g_midiList.size();
-      saveCurrentMidiConfig(g_midiIdx);
-      loadMidi(g_midiIdx);
-    } else if (cardputer_keyboard::pressed_nav_up(ks, prevKeys)) {
-      g_vol_dB = (g_vol_dB + 3.0f < 0.0f) ? g_vol_dB + 3.0f : 0.0f;
-      if (g_tsf) {
-        xSemaphoreTake(g_tsfMutex, portMAX_DELAY);
-        tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
-        xSemaphoreGive(g_tsfMutex);
+    if (useDualDisplay()) {
+      if (cardputer_keyboard::pressed_nav_right(ks, prevKeys)) {
+        dualListPageMove(+1);
+      } else if (cardputer_keyboard::pressed_nav_left(ks, prevKeys)) {
+        dualListPageMove(-1);
+      } else if (cardputer_keyboard::pressed_nav_up(ks, prevKeys)) {
+        if (g_dualListCursor > 0) {
+          --g_dualListCursor;
+          if (g_dualListCursor < g_dualListScroll) g_dualListScroll = g_dualListCursor;
+          g_dualListDirty = true;
+          g_needRedraw = true;
+        }
+      } else if (cardputer_keyboard::pressed_nav_down(ks, prevKeys)) {
+        int maxIdx = (int)g_midiList.size() - 1;
+        if (g_dualListCursor < maxIdx) {
+          ++g_dualListCursor;
+          if (g_dualListCursor >= g_dualListScroll + DUAL_LIST_ROWS) {
+            g_dualListScroll = g_dualListCursor - DUAL_LIST_ROWS + 1;
+          }
+          g_dualListDirty = true;
+          g_needRedraw = true;
+        }
       }
-      Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
-    } else if (cardputer_keyboard::pressed_nav_down(ks, prevKeys)) {
-      g_vol_dB = (g_vol_dB - 3.0f > -40.0f) ? g_vol_dB - 3.0f : -40.0f;
-      if (g_tsf) {
-        xSemaphoreTake(g_tsfMutex, portMAX_DELAY);
-        tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
-        xSemaphoreGive(g_tsfMutex);
+      if (cardputer_keyboard::pressed_enter(ks, prevKeys)
+          && g_dualListCursor >= 0
+          && g_dualListCursor < (int)g_midiList.size()) {
+        saveCurrentMidiConfig(g_dualListCursor);
+        loadMidi(g_dualListCursor);
       }
-      Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
+    } else {
+      if (cardputer_keyboard::pressed_nav_right(ks, prevKeys)) {
+        g_midiIdx = (g_midiIdx + 1) % (int)g_midiList.size();
+        saveCurrentMidiConfig(g_midiIdx);
+        loadMidi(g_midiIdx);
+      } else if (cardputer_keyboard::pressed_nav_left(ks, prevKeys)) {
+        g_midiIdx = (g_midiIdx - 1 + (int)g_midiList.size()) % (int)g_midiList.size();
+        saveCurrentMidiConfig(g_midiIdx);
+        loadMidi(g_midiIdx);
+      } else if (cardputer_keyboard::pressed_nav_up(ks, prevKeys)) {
+        g_vol_dB = (g_vol_dB + 3.0f < 0.0f) ? g_vol_dB + 3.0f : 0.0f;
+        if (g_tsf) {
+          xSemaphoreTake(g_tsfMutex, portMAX_DELAY);
+          tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
+          xSemaphoreGive(g_tsfMutex);
+        }
+        g_dualListDirty = true;
+        g_needRedraw = true;
+        Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
+      } else if (cardputer_keyboard::pressed_nav_down(ks, prevKeys)) {
+        g_vol_dB = (g_vol_dB - 3.0f > -40.0f) ? g_vol_dB - 3.0f : -40.0f;
+        if (g_tsf) {
+          xSemaphoreTake(g_tsfMutex, portMAX_DELAY);
+          tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
+          xSemaphoreGive(g_tsfMutex);
+        }
+        g_dualListDirty = true;
+        g_needRedraw = true;
+        Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
+      }
     }
 
     for (char c : ks.word) {
       if (c == 'r' || c == 'R') { loadMidi(g_midiIdx); break; }
-      if (c == 'l' || c == 'L') { g_looping = !g_looping; g_needRedraw = true; }
+      if (c == 'l' || c == 'L') { g_looping = !g_looping; g_needRedraw = true; g_dualListDirty = true; }
       if (c == '+' || c == '=') {
         g_vol_dB = (g_vol_dB + 3.0f < 0.0f) ? g_vol_dB + 3.0f : 0.0f;
         if (g_tsf) {
@@ -1298,6 +1504,8 @@ static void playerUiStep() {
           tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
           xSemaphoreGive(g_tsfMutex);
         }
+        g_dualListDirty = true;
+        g_needRedraw = true;
         Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
       }
       if (c == '-' || c == '_') {
@@ -1307,6 +1515,8 @@ static void playerUiStep() {
           tsf_set_output(g_tsf, currentSynthOutputMode(), (int)g_sampleRate, g_vol_dB);
           xSemaphoreGive(g_tsfMutex);
         }
+        g_dualListDirty = true;
+        g_needRedraw = true;
         Serial.printf("[VOL] %.0f dB\r\n", g_vol_dB);
       }
       if (c == 'm' || c == 'M' || c == 'f' || c == 'F') { openFileSelector(); break; }
@@ -1315,7 +1525,8 @@ static void playerUiStep() {
     prevKeys = ks;
   }
 
-  if (now - g_lastUiMs >= 66) {
+  uint32_t uiRefreshMs = useDualDisplay() ? DUAL_UI_REFRESH_MS : SINGLE_UI_REFRESH_MS;
+  if (now - g_lastUiMs >= uiRefreshMs) {
     g_lastUiMs = now;
     if (g_fullRedraw) {
       redrawFull();
@@ -1483,6 +1694,7 @@ static void setPlaybackState(bool playing) {
   g_lastPlaybackActivityMs = millis();
   if (playing) {
     g_idleSplashActive = false;
+    g_extPausedBlank = false;
   }
   if (!playing && g_tsf) {
     xSemaphoreTake(g_tsfMutex, portMAX_DELAY);
@@ -1494,6 +1706,7 @@ static void setPlaybackState(bool playing) {
   }
   g_fullRedraw = true;
   g_needRedraw = true;
+  g_dualListDirty = true;
 }
 
 static void saveCurrentMidiConfig(int idx) {
@@ -1556,6 +1769,7 @@ static void buildMidiList(const String& folder, const String& target) {
   g_midiIdx = 0;
   for (int i = 0; i < (int)g_midiList.size(); i++)
     if (g_midiList[i] == target) { g_midiIdx = i; break; }
+  syncDualListSelectionToCurrent();
 }
 
 static bool loadMidi(int idx) {
@@ -1633,6 +1847,7 @@ static bool loadMidi(int idx) {
   g_idleSplashActive = false;
   clearTrackAdvance();
   resetEs8311Buffers(false);
+  syncDualListSelectionToCurrent();
   invalidateUiCache();
   g_fullRedraw = true;
   Serial.printf("[MIDI] %s  stream=1 src=%s tracks=%u fmt=%u dur=%us\r\n",
@@ -1839,6 +2054,215 @@ static void tickMidi(double deltaMs) {
 #define C_WARN    ((uint16_t)0xFBE0)
 #define C_SEP     ((uint16_t)0x4208)
 
+static void drawDualMidiListFull() {
+  auto& d = M5Cardputer.Display;
+  constexpr int hdrH = 13;
+  constexpr int footH = 11;
+  constexpr int rowH = 11;
+  constexpr int listY = hdrH;
+  d.startWrite();
+  d.fillScreen(C_BG);
+  d.fillRect(0, 0, 240, hdrH, C_HDR_BG);
+  d.setTextColor(C_TEXT, C_HDR_BG);
+  d.setTextSize(1);
+  d.setCursor(2, 2);
+  d.print(g_playing ? "\x10 " : "|| ");
+  d.print(g_looping ? "[L] " : "    ");
+  d.print("Dual MIDI");
+  char info[32];
+  buildDualListHeaderInfoText(info, sizeof(info));
+  int infoX = 240 - (int)strlen(info) * 6 - 2;
+  d.setCursor(infoX, 2);
+  d.print(info);
+
+  int count = (int)g_midiList.size();
+  for (int row = 0; row < DUAL_LIST_ROWS; ++row) {
+    int idx = g_dualListScroll + row;
+    int y = listY + row * rowH;
+    uint16_t bg = (row & 1) ? C_DARKER : C_BG;
+    d.fillRect(0, y, 240, rowH, bg);
+    if (idx >= count) continue;
+
+    bool selected = idx == g_dualListCursor;
+    bool current  = idx == g_midiIdx;
+    if (selected) {
+      bg = (uint16_t)0x0318;
+      d.fillRect(0, y, 240, rowH, bg);
+      d.drawRoundRect(0, y, 239, rowH, 2, C_ACCENT);
+    }
+
+    uint16_t badge = current ? (g_playing ? C_ACTIVE : C_WARN) : (uint16_t)0x39E7;
+    d.fillRect(2, y + 1, 10, rowH - 2, badge);
+    d.setTextColor(C_BG, badge);
+    d.setCursor(4, y + 2);
+    d.print(current ? (g_playing ? ">" : "=") : " ");
+
+    d.setTextColor(selected ? C_TEXT : (current ? C_ACCENT : C_DIM), bg);
+    d.setCursor(15, y + 2);
+    String label = trackTitleFromPath(g_midiList[idx]);
+    int maxChars = 35;
+    if ((int)label.length() > maxChars) label = label.substring(0, maxChars - 1) + "~";
+    d.print(label);
+  }
+
+  d.fillRect(0, 124, 240, footH, (uint16_t)0x1082);
+  d.setTextColor(C_DIM, (uint16_t)0x1082);
+  d.setCursor(2, 127);
+  d.print(";.:sel ,/:pg ENT:play -=:vol");
+  d.endWrite();
+  syncDualListCache();
+  g_dualListDirty = false;
+}
+
+static void drawExternalHeader() {
+  if (!g_extDisplayReady || !g_extTft) return;
+  g_extTft->fillRect(0, 0, EXT_LCD_W, 18, TFT_NAVY);
+  g_extTft->setTextColor(TFT_WHITE, TFT_NAVY);
+  g_extTft->drawString(g_playing ? "PLAY" : "PAUSE", 4, 2, 2);
+  if (g_looping) {
+    g_extTft->setTextColor(TFT_YELLOW, TFT_NAVY);
+    g_extTft->drawString("LOOP", 52, 2, 2);
+  }
+
+  char info[28];
+  buildHeaderInfoText(info, sizeof(info));
+  g_extTft->setTextColor(TFT_CYAN, TFT_NAVY);
+  g_extTft->drawRightString(info, EXT_LCD_W - 4, 2, 2);
+
+  int infoW = g_extTft->textWidth(info, 2);
+  int titleX = g_looping ? 88 : 58;
+  int titleRight = EXT_LCD_W - infoW - 30;  // Keep at least ~5 chars away from the file counter
+  int titleW = titleRight - titleX;
+  if (titleW < 40) titleW = 40;
+  if (titleX + titleW > EXT_LCD_W) titleW = EXT_LCD_W - titleX;
+  int visibleChars = std::max(6, titleW / 12);
+
+  g_extTft->fillRect(titleX, 0, titleW, 18, TFT_NAVY);
+  g_extTft->setViewport(titleX, 0, titleW, 18, true);
+  g_extTft->setTextColor(TFT_WHITE, TFT_NAVY);
+  g_extTft->drawString(currentTrackTitleWindowForChars(visibleChars), 0, 2, 2);
+  g_extTft->resetViewport();
+}
+
+static void blankExternalMonitor() {
+  if (!g_extDisplayReady || !g_extTft || g_extPausedBlank) return;
+  g_extTft->startWrite();
+  g_extTft->fillScreen(TFT_BLACK);
+  g_extTft->endWrite();
+  g_extPausedBlank = true;
+}
+
+static void drawExternalProgressBar() {
+  if (!g_extDisplayReady || !g_extTft) return;
+  int y = EXT_LCD_H - 12;
+  g_extTft->fillRect(0, y, EXT_LCD_W, 12, TFT_DARKGREY);
+  int w = (g_songDurMs > 0 && g_midiMs > 0.0)
+        ? std::min(EXT_LCD_W, (int)(EXT_LCD_W * g_midiMs / (double)g_songDurMs))
+        : 0;
+  if (w > 0) g_extTft->fillRect(0, y, w, 3, TFT_GREEN);
+  g_extTft->setTextColor(TFT_WHITE, TFT_DARKGREY);
+  g_extTft->drawString(audioModeShortLabel(g_audioMode), 4, y + 4, 1);
+  g_extTft->drawRightString(";.:sel ,/:pg -=:vol M:Menu", EXT_LCD_W - 4, y + 2, 1);
+}
+
+static void drawExternalChannelRow(int ch) {
+  if (!g_extDisplayReady || !g_extTft) return;
+  const int colW = EXT_LCD_W / 2;
+  const int rowH = 26;
+  const int rowBaseY = 18;
+  int col = ch / 8;
+  int row = ch % 8;
+  int x = col * colW;
+  int y = rowBaseY + row * rowH;
+
+  const ChannelInfo& ci = g_ch[ch];
+  bool active = ci.active;
+  bool drum   = ci.isDrum || (ch == 9);
+  uint16_t rowBg = TFT_BLACK;
+  g_extTft->fillRect(x, y, colW, rowH, rowBg);
+
+  uint16_t badge = active ? (drum ? TFT_ORANGE : TFT_GREEN) : TFT_LIGHTGREY;
+  g_extTft->fillRect(x, y, 22, rowH, badge);
+  g_extTft->setTextColor(TFT_BLACK, badge);
+  g_extTft->drawCentreString(String(ch + 1), x + 11, y + 4, 2);
+
+  g_extTft->setTextColor(active ? TFT_WHITE : TFT_LIGHTGREY, rowBg);
+  char nb[10] = {};
+  const char* nm = drum ? "DrumKit" : (ci.program < 128 ? GM_NAMES[ci.program] : "---");
+  strncpy(nb, nm, 9);
+  g_extTft->drawString(nb, x + 26, y + 4, 2);
+
+  int rx = x + 88;
+  g_extTft->fillRect(rx, y + 4, 42, rowH - 8, TFT_NAVY);
+  if (active) {
+    uint16_t nc = drum ? TFT_ORANGE : TFT_CYAN;
+    for (int k = 0; k < 4; ++k) {
+      uint8_t n = ci.noteHistory[k];
+      if (!n) continue;
+      int nx = rx + n * 42 / 128;
+      uint8_t age = (ci.histIdx - k) & 3;
+      uint16_t shade = (age == 0) ? nc : (uint16_t)((nc >> 1) & 0x7BEF);
+      g_extTft->fillRect(nx, y + 5, 3, rowH - 10, shade);
+    }
+  }
+
+  int vx = x + 134;
+  g_extTft->fillRect(vx, y + 4, 20, rowH - 8, TFT_NAVY);
+  if (active && ci.velocity > 0) {
+    int vw = ci.velocity * 20 / 127;
+    uint16_t vc = (ci.velocity > 100) ? TFT_YELLOW : TFT_CYAN;
+    g_extTft->fillRect(vx, y + 4, vw, rowH - 8, vc);
+  }
+
+  if (col == 0) g_extTft->drawFastVLine(colW - 1, y, rowH, TFT_DARKGREY);
+}
+
+static void redrawExternalMonitorFull() {
+  if (!useDualDisplay() || !g_extTft) return;
+  if (g_idleSplashActive) {
+    blankExternalMonitor();
+    syncExternalUiCache();
+    return;
+  }
+  g_extPausedBlank = false;
+  g_extTft->startWrite();
+  g_extTft->fillScreen(TFT_BLACK);
+  drawExternalHeader();
+  for (int i = 0; i < 16; ++i) drawExternalChannelRow(i);
+  drawExternalProgressBar();
+  g_extTft->endWrite();
+  syncExternalUiCache();
+}
+
+static void redrawExternalMonitorPartial() {
+  if (!useDualDisplay() || !g_extTft) return;
+  if (g_idleSplashActive) {
+    blankExternalMonitor();
+    syncExternalUiCache();
+    return;
+  }
+  g_extPausedBlank = false;
+  bool headerDirty = g_extLastHeaderElapsedSec  != (uint32_t)(g_midiMs / 1000.0)
+                  || g_extLastHeaderTotalSec    != (g_songDurMs / 1000)
+                  || g_extLastHeaderMidiIdx     != g_midiIdx
+                  || g_extLastHeaderPlaying     != g_playing
+                  || g_extLastHeaderLooping     != g_looping
+                  || g_extLastHeaderTitleScroll != currentHeaderTitleScrollIndex();
+  int progressW = (g_songDurMs > 0 && g_midiMs > 0.0)
+                ? std::min(EXT_LCD_W, (int)(EXT_LCD_W * g_midiMs / (double)g_songDurMs))
+                : 0;
+  bool progressDirty = g_extLastProgressW != progressW;
+
+  g_extTft->startWrite();
+  if (headerDirty) drawExternalHeader();
+  for (int i = 0; i < 16; ++i) {
+    if (g_dirtyChannelMask & (uint16_t)(1u << i)) drawExternalChannelRow(i);
+  }
+  if (progressDirty) drawExternalProgressBar();
+  g_extTft->endWrite();
+  syncExternalUiCache();
+}
+
 static const int ROW_H  = 14;
 static const int ROW_Y0 = 13;
 static const int COL_W  = 120;
@@ -1946,6 +2370,15 @@ static void drawChannelRow(int ch) {
 }
 
 static void redrawFull() {
+  if (useDualDisplay()) {
+    drawDualMidiListFull();
+    redrawExternalMonitorFull();
+    g_dirtyChannelMask = 0;
+    g_fullRedraw = false;
+    g_needRedraw = false;
+    return;
+  }
+
   auto& d = M5Cardputer.Display;
   d.startWrite();
   d.fillScreen(C_BG);
@@ -1960,6 +2393,22 @@ static void redrawFull() {
 }
 
 static void redrawPartial() {
+  if (useDualDisplay()) {
+    bool dualHeaderDirty = g_lastDualHeaderMidiIdx    != g_midiIdx
+                        || g_lastDualHeaderPlaying    != g_playing
+                        || g_lastDualHeaderLooping    != g_looping
+                        || g_lastDualListCursor       != g_dualListCursor
+                        || g_lastDualListScroll       != g_dualListScroll
+                        || g_lastDualCurrentMidiIdx   != g_midiIdx;
+    if (g_dualListDirty || dualHeaderDirty) {
+      drawDualMidiListFull();
+    }
+    redrawExternalMonitorPartial();
+    g_dirtyChannelMask = 0;
+    g_needRedraw = false;
+    return;
+  }
+
   bool headerDirty = g_lastHeaderElapsedSec != (uint32_t)(g_midiMs / 1000.0)
                   || g_lastHeaderTotalSec   != (g_songDurMs / 1000)
                   || g_lastHeaderMidiIdx    != g_midiIdx
@@ -2030,6 +2479,131 @@ static String tailForUi(const String& path, size_t maxChars = 28) {
   return path.substring(path.length() - (int)maxChars);
 }
 
+static const char* audioModeShortLabel(AudioMode mode) {
+  switch (mode) {
+    case AUDIO_ES8311:  return "ES8311";
+    case AUDIO_I2S_DAC: return "I2S DAC";
+    case AUDIO_PDM:     return "PDM";
+    case AUDIO_PWM:     return "PWM";
+    default:            return "--";
+  }
+}
+
+static bool initExternalDisplay() {
+  if (g_displayMode != DISPLAY_DUAL) {
+    g_extTft.reset();
+    g_extDisplayReady = false;
+    return false;
+  }
+
+  g_extTft.reset();
+  g_extTft.reset(new TFT_eSPI());
+  g_extTft->begin();
+  g_extTft->setRotation(3);
+  g_extTft->setSwapBytes(true);
+  g_extTft->fillScreen(TFT_BLACK);
+  g_extDisplayReady = true;
+  g_dirtyChannelMask = 0xFFFFu;
+  return true;
+}
+
+static DisplayMode selectDisplayMode(int saved) {
+  auto& d = M5Cardputer.Display;
+  struct Opt {
+    DisplayMode mode;
+    const char* key;
+    const char* label;
+    uint16_t col;
+  };
+
+  const Opt opts[] = {
+    { DISPLAY_SINGLE, "1", "Single display", 0x07FF },
+    { DISPLAY_DUAL,   "2", "Dual display",   0xFFE0 },
+  };
+  int sel = (saved == (int)DISPLAY_DUAL) ? 1 : 0;
+  bool confirmed = false;
+
+  auto draw = [&]() {
+    d.fillScreen((uint16_t)0x000A);
+    d.setTextColor(C_ACCENT, (uint16_t)0x000A);
+    d.setTextSize(1);
+    d.setCursor(4, 4);
+    d.print("GM MIDI PLAYER  \xBB  Display mode");
+    d.drawFastHLine(0, 14, 240, C_ACCENT);
+    for (int i = 0; i < 2; ++i) {
+      int y = 36 + i * 30;
+      uint16_t bg = (i == sel) ? (uint16_t)0x0318 : (uint16_t)0x000A;
+      d.fillRoundRect(10, y, 220, 22, 3, bg);
+      d.drawRoundRect(10, y, 220, 22, 3, (i == sel) ? opts[i].col : (uint16_t)0x4208);
+      d.fillRoundRect(14, y + 5, 16, 12, 2, opts[i].col);
+      d.setTextColor((uint16_t)0x000A, opts[i].col);
+      d.setCursor(18, y + 8);
+      d.print(opts[i].key);
+      d.setTextColor(C_TEXT, bg);
+      d.setCursor(38, y + 7);
+      d.print(opts[i].label);
+    }
+    d.fillRect(0, 124, 240, 11, (uint16_t)0x1082);
+    d.setTextColor(C_DIM, (uint16_t)0x1082);
+    d.setCursor(4, 127);
+    d.print(";.:nav  1-2:quick  / or ENT:ok");
+  };
+
+  draw();
+  M5Cardputer.update();
+  cardputer_keyboard::KeysState prevKeys = M5Cardputer.Keyboard.keysState();
+  bool inputArmed = !keysStateHasAnyInput(prevKeys);
+  while (!confirmed) {
+    M5Cardputer.update();
+    auto ks = M5Cardputer.Keyboard.keysState();
+    if (!inputArmed) {
+      inputArmed = !keysStateHasAnyInput(ks);
+      prevKeys = ks;
+      delay(5);
+      continue;
+    }
+
+    bool kbChanged = cardputer_keyboard::state_changed(ks, prevKeys);
+    if (!kbChanged) { delay(5); continue; }
+    if (!ks.fn) {
+      if (cardputer_keyboard::pressed_digit(ks, prevKeys, '1')) { sel = 0; confirmed = true; }
+      if (cardputer_keyboard::pressed_digit(ks, prevKeys, '2')) { sel = 1; confirmed = true; }
+    }
+    if (!confirmed && (cardputer_keyboard::pressed_word_ci(ks, prevKeys, 'w') ||
+                       cardputer_keyboard::pressed_nav_up(ks, prevKeys))) {
+      sel = (sel + 1) % 2;
+      draw();
+    }
+    if (!confirmed && (cardputer_keyboard::pressed_word_ci(ks, prevKeys, 's') ||
+                       cardputer_keyboard::pressed_nav_down(ks, prevKeys))) {
+      sel = (sel + 1) % 2;
+      draw();
+    }
+    if (!confirmed && (cardputer_keyboard::pressed_enter(ks, prevKeys) ||
+                       cardputer_keyboard::pressed_nav_right(ks, prevKeys))) {
+      confirmed = true;
+    }
+    prevKeys = ks;
+    delay(5);
+  }
+
+  delay(120);
+  return opts[sel].mode;
+}
+
+static void dualListPageMove(int dir) {
+  int count = (int)g_midiList.size();
+  if (count <= 0) return;
+  g_dualListCursor += dir * DUAL_LIST_ROWS;
+  if (g_dualListCursor < 0) g_dualListCursor = 0;
+  if (g_dualListCursor >= count) g_dualListCursor = count - 1;
+  g_dualListScroll = (g_dualListCursor / DUAL_LIST_ROWS) * DUAL_LIST_ROWS;
+  int maxScroll = std::max(0, count - DUAL_LIST_ROWS);
+  if (g_dualListScroll > maxScroll) g_dualListScroll = maxScroll;
+  g_dualListDirty = true;
+  g_needRedraw = true;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // MENU SELEZIONE MODALITÀ AUDIO
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2040,43 +2614,34 @@ static AudioMode selectAudioMode(int saved) {
 
   struct Opt {
     AudioMode    mode;
-    const char*  key;
+    char         key;
     const char*  label;
     const char*  desc;
     const char*  hw;
     uint16_t     col;
   };
 
+  Opt opts[4];
+  int N = 0;
+  bool allowI2SDac = (g_displayMode != DISPLAY_DUAL);
+  char nextKey = '1';
+
 #ifndef CARDPUTER_V11
-  const Opt opts[] = {
-    { AUDIO_ES8311,  "1", "ADV built-in ES8311",
-      "22kHz mono - built-in output",
-      "3.5mm jack + internal speaker",  0xFFE0 },
-    { AUDIO_I2S_DAC, "2", "External I2S DAC",
-      "22kHz stereo - external DAC",
-      "MAX98357A / PCM5102 on GPIO 6/7/8", 0x07E0 },
-    { AUDIO_PDM,     "3", "PDM speaker GPIO2",
-      "16kHz mono - no extra hardware",
-      "Cardputer built-in speaker",   0x07FF },
-    { AUDIO_PWM,     "4", "PWM LEDC GPIO2",
-      "16kHz mono - universal fallback",
-      "Cardputer built-in speaker",   0xFD20 },
-  };
-  const int N = 4;
-#else
-  const Opt opts[] = {
-    { AUDIO_I2S_DAC, "1", "External I2S DAC",
-      "22kHz stereo - external DAC",
-      "MAX98357A / PCM5102 on GPIO 6/7/8", 0x07E0 },
-    { AUDIO_PDM,     "2", "PDM speaker GPIO2",
-      "16kHz mono - no extra hardware",
-      "Cardputer built-in speaker",   0x07FF },
-    { AUDIO_PWM,     "3", "PWM LEDC GPIO2",
-      "16kHz mono - universal fallback",
-      "Cardputer built-in speaker",   0xFD20 },
-  };
-  const int N = 3;
+  opts[N++] = { AUDIO_ES8311,  nextKey++, "ADV built-in ES8311",
+                "22kHz mono - built-in output",
+                "3.5mm jack + internal speaker",  0xFFE0 };
 #endif
+  if (allowI2SDac) {
+    opts[N++] = { AUDIO_I2S_DAC, nextKey++, "External I2S DAC",
+                  "22kHz stereo - external DAC",
+                  "MAX98357A / PCM5102 on GPIO 6/7/8", 0x07E0 };
+  }
+  opts[N++] = { AUDIO_PDM, nextKey++, "PDM speaker GPIO2",
+                "16kHz mono - no extra hardware",
+                "Cardputer built-in speaker", 0x07FF };
+  opts[N++] = { AUDIO_PWM, nextKey++, "PWM LEDC GPIO2",
+                "16kHz mono - universal fallback",
+                "Cardputer built-in speaker", 0xFD20 };
 
   // Find the default index from the saved config.
   int sel = 0;
@@ -2114,9 +2679,7 @@ static AudioMode selectAudioMode(int saved) {
     d.fillRect(0, 124, 240, 11, (uint16_t)0x1082);
     d.setTextColor(C_DIM, (uint16_t)0x1082);
     d.setCursor(4, 127);
-    char footer[40];
-    snprintf(footer, sizeof(footer), ";.:nav  1-%d:quick  / or ENT:ok", N);
-    d.print(footer);
+    d.print(";.:nav  digits:quick  / or ENT:ok");
   };
 
   draw();
@@ -2138,7 +2701,7 @@ static AudioMode selectAudioMode(int saved) {
     if (!kbChanged) { delay(5); continue; }
     if (!ks.fn) {
       for (int i = 0; i < N; i++) {
-        if (cardputer_keyboard::pressed_digit(ks, prevKeys, static_cast<char>('1' + i))) {
+        if (cardputer_keyboard::pressed_digit(ks, prevKeys, opts[i].key)) {
           sel = i;
           confirmed = true;
           break;
@@ -2430,6 +2993,15 @@ void setup() {
 
   // Load saved config.
   g_cfg = loadConfig();
+  g_displayMode     = selectDisplayMode(g_cfg.displayMode);
+  g_cfg.displayMode = (int)g_displayMode;
+  if (g_displayMode == DISPLAY_DUAL) {
+    initExternalDisplay();
+  } else {
+    g_extTft.reset();
+    g_extDisplayReady = false;
+  }
+
   // Select the audio mode, using the saved config as the default.
 
   g_audioMode      = selectAudioMode(g_cfg.audioMode);
@@ -2571,17 +3143,19 @@ static void es8311AudioStep() {
     bool ok = M5Cardputer.Speaker.playRaw(g_es8311Buf[readyIdx], ES8311_CHUNK_FRAMES, g_sampleRate, false, 1, 0, false);
     uint32_t playUs = micros() - playStartUs;
 
-    if (g_perf.startedMs == 0) perfReset(millis());
-    ++g_perf.playCalls;
-    g_perf.playUsTotal += playUs;
-    if (playUs > g_perf.playUsMax) g_perf.playUsMax = playUs;
+    if (PERF_LOG_ENABLED) {
+      if (g_perf.startedMs == 0) perfReset(millis());
+      ++g_perf.playCalls;
+      g_perf.playUsTotal += playUs;
+      if (playUs > g_perf.playUsMax) g_perf.playUsMax = playUs;
+    }
 
     if (!ok) {
-      ++g_perf.playFail;
+      if (PERF_LOG_ENABLED) ++g_perf.playFail;
       break;
     }
 
-    ++g_perf.playOk;
+    if (PERF_LOG_ENABLED) ++g_perf.playOk;
     g_es8311BufState[readyIdx] = ES8311_BUF_QUEUED;
     g_es8311QueueOrder[(g_es8311QueueHead + g_es8311QueueCount) % ES8311_QUEUE_BUFFERS] = (uint8_t)readyIdx;
     ++g_es8311QueueCount;
@@ -2598,21 +3172,23 @@ static void es8311AudioStep() {
 
     g_es8311BufState[emptyIdx] = ES8311_BUF_READY;
 
-    if (g_perf.startedMs == 0) perfReset(millis());
-    ++g_perf.chunkCalls;
-    g_perf.chunkUsTotal += stepUs;
-    if (stepUs > g_perf.chunkUsMax) g_perf.chunkUsMax = stepUs;
-    if (chunkBudgetUs && stepUs > chunkBudgetUs) ++g_perf.lateChunks;
-    g_perf.renderUsTotal += renderStats.eventUs + renderStats.synthUs;
-    if (renderStats.eventUs + renderStats.synthUs > g_perf.renderUsMax) {
-      g_perf.renderUsMax = renderStats.eventUs + renderStats.synthUs;
+    if (PERF_LOG_ENABLED) {
+      if (g_perf.startedMs == 0) perfReset(millis());
+      ++g_perf.chunkCalls;
+      g_perf.chunkUsTotal += stepUs;
+      if (stepUs > g_perf.chunkUsMax) g_perf.chunkUsMax = stepUs;
+      if (chunkBudgetUs && stepUs > chunkBudgetUs) ++g_perf.lateChunks;
+      g_perf.renderUsTotal += renderStats.eventUs + renderStats.synthUs;
+      if (renderStats.eventUs + renderStats.synthUs > g_perf.renderUsMax) {
+        g_perf.renderUsMax = renderStats.eventUs + renderStats.synthUs;
+      }
+      g_perf.eventUsTotal += renderStats.eventUs;
+      if (renderStats.eventUs > g_perf.eventUsMax) g_perf.eventUsMax = renderStats.eventUs;
+      g_perf.synthUsTotal += renderStats.synthUs;
+      if (renderStats.synthUs > g_perf.synthUsMax) g_perf.synthUsMax = renderStats.synthUs;
+      g_perf.midiEvents += renderStats.midiEvents;
+      g_perf.synthSegments += renderStats.synthSegments;
     }
-    g_perf.eventUsTotal += renderStats.eventUs;
-    if (renderStats.eventUs > g_perf.eventUsMax) g_perf.eventUsMax = renderStats.eventUs;
-    g_perf.synthUsTotal += renderStats.synthUs;
-    if (renderStats.synthUs > g_perf.synthUsMax) g_perf.synthUsMax = renderStats.synthUs;
-    g_perf.midiEvents += renderStats.midiEvents;
-    g_perf.synthSegments += renderStats.synthSegments;
   }
 
   while (g_es8311QueueCount < 2) {
@@ -2623,17 +3199,19 @@ static void es8311AudioStep() {
     bool ok = M5Cardputer.Speaker.playRaw(g_es8311Buf[readyIdx], ES8311_CHUNK_FRAMES, g_sampleRate, false, 1, 0, false);
     uint32_t playUs = micros() - playStartUs;
 
-    if (g_perf.startedMs == 0) perfReset(millis());
-    ++g_perf.playCalls;
-    g_perf.playUsTotal += playUs;
-    if (playUs > g_perf.playUsMax) g_perf.playUsMax = playUs;
+    if (PERF_LOG_ENABLED) {
+      if (g_perf.startedMs == 0) perfReset(millis());
+      ++g_perf.playCalls;
+      g_perf.playUsTotal += playUs;
+      if (playUs > g_perf.playUsMax) g_perf.playUsMax = playUs;
+    }
 
     if (!ok) {
-      ++g_perf.playFail;
+      if (PERF_LOG_ENABLED) ++g_perf.playFail;
       break;
     }
 
-    ++g_perf.playOk;
+    if (PERF_LOG_ENABLED) ++g_perf.playOk;
     g_es8311BufState[readyIdx] = ES8311_BUF_QUEUED;
     g_es8311QueueOrder[(g_es8311QueueHead + g_es8311QueueCount) % ES8311_QUEUE_BUFFERS] = (uint8_t)readyIdx;
     ++g_es8311QueueCount;
@@ -2648,10 +3226,12 @@ void loop() {
   uint32_t uiStartUs = micros();
   playerUiStep();
   uint32_t uiUs = micros() - uiStartUs;
-  if (g_perf.startedMs == 0) perfReset(millis());
-  ++g_perf.uiCalls;
-  g_perf.uiUsTotal += uiUs;
-  if (uiUs > g_perf.uiUsMax) g_perf.uiUsMax = uiUs;
+  if (PERF_LOG_ENABLED) {
+    if (g_perf.startedMs == 0) perfReset(millis());
+    ++g_perf.uiCalls;
+    g_perf.uiUsTotal += uiUs;
+    if (uiUs > g_perf.uiUsMax) g_perf.uiUsMax = uiUs;
+  }
 
   if (g_audioMode == AUDIO_ES8311) es8311AudioStep();
   perfMaybeLog();
