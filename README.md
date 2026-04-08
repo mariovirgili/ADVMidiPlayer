@@ -1,6 +1,27 @@
 # GM MIDI Player - M5Stack Cardputer ADV
 ### PlatformIO firmware for MIDI playback with SF2 soundfonts, SD browser, single/dual display UI, runtime menu, and persistent settings
 
+## Media
+
+<p align="center">
+  <img src="media/1.jpg" alt="Dual display 1" width="32%">
+  <img src="media/2.jpg" alt="Dual display 2" width="32%">
+  <img src="media/3.jpg" alt="Dual display 3" width="32%">
+</p>
+
+<p align="center">
+  <img src="media/4.jpg" alt="Dual display 4" width="32%">
+  <img src="media/5.jpg" alt="Dual display 5" width="32%">
+  <img src="media/6.jpg" alt="Dual display 6" width="32%">
+</p>
+
+<p align="center">
+  <img src="media/7.jpg" alt="Dual display 7" width="32%">
+  <img src="media/ScreenTitle_boot.jpg" alt="Boot splash" width="32%">
+</p>
+
+Demo video: [media/video.mp4](media/video.mp4)
+
 ---
 
 ## Overview
